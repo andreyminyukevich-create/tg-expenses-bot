@@ -30,7 +30,6 @@ const GROUPS = [
 const sessions = new Map();
 const SESSION_TTL = 30 * 60 * 1000;
 
-// Массивы с шутками для разных ситуаций
 const ERRORS = {
   invalidAmount: [
     "🤨 Это сумма или код от сейфа?",
@@ -99,6 +98,10 @@ function todayDDMMYYYY() {
   return `${dd}.${mm}.${yyyy}`;
 }
 
+function formatNumber(num) {
+  return new Intl.NumberFormat("ru-RU").format(num);
+}
+
 async function api(payload) {
   const res = await fetch(SCRIPT_URL, {
     method: "POST",
@@ -123,6 +126,13 @@ async function appendRow(d) {
     whom: d.whom,
     group: d.group,
     what: d.what,
+  });
+}
+
+async function getStats(period) {
+  return await api({
+    action: "stats",
+    period: period, // "today" или "month"
   });
 }
 
@@ -172,7 +182,13 @@ function renderScreen(st) {
 }
 
 function kbMain(hasDraft) {
-  const rows = [[Markup.button.callback("Внести транзакцию", "start")]];
+  const rows = [
+    [Markup.button.callback("Внести транзакцию", "start")],
+    [
+      Markup.button.callback("📊 За сегодня", "stats:today"),
+      Markup.button.callback("📅 За месяц", "stats:month")
+    ]
+  ];
   if (hasDraft) {
     rows.push([
       Markup.button.callback("Продолжить", "resume"), 
@@ -264,9 +280,88 @@ bot.start(async (ctx) => {
   await updateScreen(ctx, st, kbMain(!!st.draft));
 });
 
+// Обработка автоматических отчётов от Google Apps Script
+bot.on("my_chat_member", () => {}); // игнорируем события бота
+
+bot.command("send_daily_report", async (ctx) => {
+  // Эта команда будет вызываться из Google Apps Script
+  const r = await getStats("today");
+  
+  if (!r.ok) {
+    console.error("Failed to get daily stats:", r.error);
+    return;
+  }
+  
+  const revenue = r.revenue || 0;
+  const expense = r.expense || 0;
+  const balance = revenue - expense;
+  const sign = balance >= 0 ? "+" : "";
+  
+  const msg = `🌙 <b>Добрый вечер! Итоги дня:</b>
+
+📅 ${r.date || todayDDMMYYYY()}
+💰 Поступлений: ${formatNumber(revenue)} ₽
+💸 Затрат: ${formatNumber(expense)} ₽
+━━━━━━━━━━━━━━━━━
+📈 Баланс дня: ${sign}${formatNumber(balance)} ₽`;
+
+  try {
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  } catch (err) {
+    console.error("Failed to send daily report:", err);
+  }
+});
+
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const st = ensureState(ctx);
+
+  // Обработка статистики
+  if (data === "stats:today" || data === "stats:month") {
+    const period = data.split(":")[1];
+    await ctx.answerCbQuery("⏳ Загружаю данные...");
+    
+    const r = await getStats(period);
+    
+    if (!r.ok) {
+      await ctx.reply(`❌ ${randomError("networkError")}`);
+      return;
+    }
+    
+    const revenue = r.revenue || 0;
+    const expense = r.expense || 0;
+    const balance = revenue - expense;
+    const sign = balance >= 0 ? "+" : "";
+    
+    if (period === "today") {
+      const msg = `📊 <b>Итоги за сегодня (${r.date || todayDDMMYYYY()})</b>
+
+💰 Выручка: ${formatNumber(revenue)} ₽
+💸 Затраты: ${formatNumber(expense)} ₽
+━━━━━━━━━━━━━━━━━
+📈 Баланс: ${sign}${formatNumber(balance)} ₽`;
+      
+      await ctx.reply(msg, { parse_mode: "HTML" });
+    } else {
+      let msg = `📊 <b>Итоги за ${r.monthName || "месяц"}</b>
+
+💰 Выручка: ${formatNumber(revenue)} ₽
+💸 Затраты: ${formatNumber(expense)} ₽
+━━━━━━━━━━━━━━━━━
+📈 Баланс: ${sign}${formatNumber(balance)} ₽`;
+
+      // Добавляем топ категорий если есть
+      if (r.topGroups && r.topGroups.length > 0) {
+        msg += "\n\n🔝 <b>Топ затрат:</b>\n";
+        r.topGroups.forEach((g, i) => {
+          msg += `${i + 1}. ${htmlEscape(g.group)} — ${formatNumber(g.amount)} ₽\n`;
+        });
+      }
+      
+      await ctx.reply(msg, { parse_mode: "HTML" });
+    }
+    return;
+  }
 
   if (data === "start") {
     st.lastNote = null;
