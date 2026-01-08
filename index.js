@@ -132,7 +132,7 @@ async function appendRow(d) {
 async function getStats(period) {
   return await api({
     action: "stats",
-    period: period, // "today" или "month"
+    period: period,
   });
 }
 
@@ -280,38 +280,6 @@ bot.start(async (ctx) => {
   await updateScreen(ctx, st, kbMain(!!st.draft));
 });
 
-// Обработка автоматических отчётов от Google Apps Script
-bot.on("my_chat_member", () => {}); // игнорируем события бота
-
-bot.command("send_daily_report", async (ctx) => {
-  // Эта команда будет вызываться из Google Apps Script
-  const r = await getStats("today");
-  
-  if (!r.ok) {
-    console.error("Failed to get daily stats:", r.error);
-    return;
-  }
-  
-  const revenue = r.revenue || 0;
-  const expense = r.expense || 0;
-  const balance = revenue - expense;
-  const sign = balance >= 0 ? "+" : "";
-  
-  const msg = `🌙 <b>Добрый вечер! Итоги дня:</b>
-
-📅 ${r.date || todayDDMMYYYY()}
-💰 Поступлений: ${formatNumber(revenue)} ₽
-💸 Затрат: ${formatNumber(expense)} ₽
-━━━━━━━━━━━━━━━━━
-📈 Баланс дня: ${sign}${formatNumber(balance)} ₽`;
-
-  try {
-    await ctx.reply(msg, { parse_mode: "HTML" });
-  } catch (err) {
-    console.error("Failed to send daily report:", err);
-  }
-});
-
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const st = ensureState(ctx);
@@ -350,7 +318,6 @@ bot.on("callback_query", async (ctx) => {
 ━━━━━━━━━━━━━━━━━
 📈 Баланс: ${sign}${formatNumber(balance)} ₽`;
 
-      // Добавляем топ категорий если есть
       if (r.topGroups && r.topGroups.length > 0) {
         msg += "\n\n🔝 <b>Топ затрат:</b>\n";
         r.topGroups.forEach((g, i) => {
@@ -429,6 +396,38 @@ bot.on("text", async (ctx) => {
   const st = ensureState(ctx);
   const text = ctx.message.text.trim();
 
+  // === АВТООТЧЁТ ===
+  if (text.startsWith("/auto_report:")) {
+    const parts = text.split(":");
+    if (parts.length < 2) return;
+    
+    const token = parts[1];
+    if (token !== TOKEN) return;
+    
+    const r = await getStats("today");
+    if (!r.ok) {
+      await ctx.reply("❌ Ошибка получения данных");
+      return;
+    }
+    
+    const revenue = r.revenue || 0;
+    const expense = r.expense || 0;
+    const balance = revenue - expense;
+    const sign = balance >= 0 ? "+" : "";
+    
+    const msg = `🌙 <b>Добрый вечер! Итоги дня:</b>
+
+📅 ${r.date || todayDDMMYYYY()}
+💰 Поступлений: ${formatNumber(revenue)} ₽
+💸 Затрат: ${formatNumber(expense)} ₽
+━━━━━━━━━━━━━━━━━
+📈 Баланс дня: ${sign}${formatNumber(balance)} ₽`;
+
+    await ctx.reply(msg, { parse_mode: "HTML" });
+    return;
+  }
+
+  // === ОБЫЧНАЯ ЛОГИКА ===
   if (!st.draft || !st.step || st.step === "type") {
     await tryDeleteUserMessage(ctx);
     await updateScreen(ctx, st, kbMain(!!st.draft));
