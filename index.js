@@ -27,8 +27,16 @@ const GROUPS = [
   "ИИ",
 ];
 
-// userId -> { screenMessageId, step, draft, lastNote }
-const sessions = new Map();
+const sessions = new Map(); // userId -> { screenId, draft, step, lastNote }
+
+function htmlEscape(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function todayDDMMYYYY() {
   const parts = new Intl.DateTimeFormat("ru-RU", {
@@ -50,6 +58,7 @@ async function api(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token: TOKEN, ...payload }),
   });
+
   const text = await res.text();
   try {
     return JSON.parse(text);
@@ -67,36 +76,29 @@ async function draftSet(userId, draft) {
 async function draftClear(userId) {
   return await api({ action: "draft_clear", userId });
 }
-async function appendRow(draft) {
+async function appendRow(d) {
   return await api({
     action: "append",
-    type: draft.type,
-    date: draft.date,
-    amount: draft.amount,
-    whom: draft.whom,
-    group: draft.group,
-    what: draft.what,
+    type: d.type,
+    date: d.date,
+    amount: d.amount,
+    whom: d.whom,
+    group: d.group,
+    what: d.what,
   });
-}
-
-function money(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n.toString() : "—";
 }
 
 function typeLabel(t) {
   return t === "expense" ? "Затраты" : t === "revenue" ? "Выручка" : "—";
 }
 
-function promptLine(step, d) {
+function promptText(step, d) {
   if (!d?.type) return "Нажмите «Внести транзакцию».";
   if (step === "amount") {
-    return d.type === "revenue"
-      ? "Какую сумму вы получили?"
-      : "Какую сумму вы потратили?";
+    return d.type === "revenue" ? "Какую сумму вы получили?" : "Какую сумму вы потратили?";
   }
   if (step === "whom") {
-    const a = money(d.amount);
+    const a = d.amount ?? "—";
     return d.type === "revenue"
       ? `Кто заплатил вам ${a}?`
       : `Кому вы заплатили ${a}?`;
@@ -106,28 +108,27 @@ function promptLine(step, d) {
   return "—";
 }
 
-function screenText(st) {
-  const d = st?.draft || {};
+function renderScreen(st) {
+  const d = st.draft || {};
   const date = d.date || todayDDMMYYYY();
 
   const lines = [];
-  lines.push(`**Транзакция**`);
-  lines.push(`Тип: **${typeLabel(d.type)}**`);
-  lines.push(`Дата: **${date}**`);
-  lines.push(`Сумма: **${d.amount != null ? money(d.amount) : "—"}**`);
-  lines.push(`Контрагент: **${d.whom || "—"}**`);
-  lines.push(`Группа: **${d.type === "expense" ? (d.group || "—") : "—"}**`);
-  lines.push(`За что: **${d.type === "expense" ? (d.what || "—") : "—"}**`);
+  lines.push(`<b>Транзакция</b>`);
+  lines.push(`Тип: <b>${htmlEscape(typeLabel(d.type))}</b>`);
+  lines.push(`Дата: <b>${htmlEscape(date)}</b>`);
+  lines.push(`Сумма: <b>${htmlEscape(d.amount ?? "—")}</b>`);
+  lines.push(`Кому/Кто: <b>${htmlEscape(d.whom || "—")}</b>`);
+  lines.push(`Группа: <b>${htmlEscape(d.type === "expense" ? (d.group || "—") : "—")}</b>`);
+  lines.push(`За что: <b>${htmlEscape(d.type === "expense" ? (d.what || "—") : "—")}</b>`);
   lines.push("");
-  if (st.lastNote) lines.push(`✅ ${st.lastNote}\n`);
-  lines.push(`➡️ ${promptLine(st.step, d)}`);
+  if (st.lastNote) lines.push(`✅ ${htmlEscape(st.lastNote)}\n`);
+  lines.push(`➡️ ${htmlEscape(promptText(st.step, d))}`);
 
   return lines.join("\n");
 }
 
 function kbMain(hasDraft) {
-  const rows = [];
-  rows.push([Markup.button.callback("Внести транзакцию", "start")]);
+  const rows = [[Markup.button.callback("Внести транзакцию", "start")]];
   if (hasDraft) rows.push([Markup.button.callback("Продолжить", "resume"), Markup.button.callback("Сбросить", "reset")]);
   return Markup.inlineKeyboard(rows);
 }
@@ -152,10 +153,6 @@ function kbGroups() {
   return Markup.inlineKeyboard(rows);
 }
 
-async function tryDeleteUserMessage(ctx) {
-  try { await ctx.deleteMessage(); } catch {}
-}
-
 function nextStep(d) {
   if (!d?.type) return "type";
   if (d.amount == null) return "amount";
@@ -165,67 +162,71 @@ function nextStep(d) {
   return null;
 }
 
-async function ensureScreen(ctx) {
+async function ensureState(ctx) {
   const userId = String(ctx.from.id);
   let st = sessions.get(userId);
 
   if (!st) {
     const r = await draftGet(userId);
     const saved = r.ok ? r.draft : null;
-
-    // saved ожидаем как {draft, step}
     const draft = saved?.draft || null;
     const step = saved?.step || (draft ? nextStep(draft) : null);
 
-    st = { screenMessageId: null, draft, step, lastNote: null };
+    st = { screenId: null, draft, step, lastNote: null };
     sessions.set(userId, st);
   }
-
-  if (!st.screenMessageId) {
-    const msg = await ctx.reply(screenText(st), {
-      parse_mode: "Markdown",
-      ...kbMain(!!st.draft),
-    });
-    st.screenMessageId = msg.message_id;
-  }
-
   return st;
 }
 
+async function ensureScreen(ctx, st) {
+  if (st.screenId) return;
+
+  const msg = await ctx.reply(renderScreen(st), {
+    parse_mode: "HTML",
+    ...kbMain(!!st.draft),
+  });
+  st.screenId = msg.message_id;
+}
+
 async function updateScreen(ctx, st, keyboard) {
+  await ensureScreen(ctx, st);
   try {
     await ctx.telegram.editMessageText(
       ctx.chat.id,
-      st.screenMessageId,
+      st.screenId,
       undefined,
-      screenText(st),
-      { parse_mode: "Markdown", ...keyboard }
+      renderScreen(st),
+      { parse_mode: "HTML", ...keyboard }
     );
   } catch {
-    st.screenMessageId = null;
-    await ensureScreen(ctx);
+    // если редактирование не получилось (например сообщение удалили) — создаём новый экран
+    st.screenId = null;
+    await ensureScreen(ctx, st);
   }
+}
+
+async function tryDeleteUserMessage(ctx) {
+  // В личке Telegram часто НЕ даёт боту удалять твои сообщения — поэтому это best effort.
+  try { await ctx.deleteMessage(); } catch {}
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
 bot.start(async (ctx) => {
-  const st = await ensureScreen(ctx);
+  const st = await ensureState(ctx);
   await updateScreen(ctx, st, kbMain(!!st.draft));
 });
 
 bot.on("callback_query", async (ctx) => {
   const userId = String(ctx.from.id);
   const data = ctx.callbackQuery.data || "";
-  const st = await ensureScreen(ctx);
+  const st = await ensureState(ctx);
 
-  const persist = async () => {
-    await draftSet(userId, { draft: st.draft, step: st.step });
-  };
+  const persist = async () => draftSet(userId, { draft: st.draft, step: st.step });
 
   if (data === "start") {
     st.lastNote = null;
-    st.draft = { date: todayDDMMYYYY() };
+    st.draft = { date: todayDDMMYYYY() }; // ДАТА ВСЕГДА СЕГОДНЯ, НЕ СПРАШИВАЕМ
     st.step = "type";
     await persist();
     await ctx.answerCbQuery("Ок");
@@ -261,7 +262,7 @@ bot.on("callback_query", async (ctx) => {
     const type = data.split(":")[1];
     st.draft = st.draft || {};
     st.draft.type = type;
-    st.draft.date = todayDDMMYYYY(); // всегда сегодня
+    st.draft.date = todayDDMMYYYY(); // ещё раз: всегда сегодня
     st.step = "amount";
     await persist();
     await ctx.answerCbQuery("Ок");
@@ -292,18 +293,17 @@ bot.on("callback_query", async (ctx) => {
 
 bot.on("text", async (ctx) => {
   const userId = String(ctx.from.id);
-  const st = await ensureScreen(ctx);
+  const st = await ensureState(ctx);
   const text = ctx.message.text.trim();
 
+  // ничего активного — просто не плодим ответы
   if (!st.draft || !st.step || st.step === "type") {
     await tryDeleteUserMessage(ctx);
     await updateScreen(ctx, st, kbMain(!!st.draft));
     return;
   }
 
-  const persist = async () => {
-    await draftSet(userId, { draft: st.draft, step: st.step });
-  };
+  const persist = async () => draftSet(userId, { draft: st.draft, step: st.step });
 
   if (st.step === "amount") {
     const val = Number(text.replace(",", "."));
@@ -331,17 +331,18 @@ bot.on("text", async (ctx) => {
       return;
     }
 
-    // revenue: сохраняем
+    // revenue: сохраняем сразу
     await persist();
     await tryDeleteUserMessage(ctx);
 
     const r = await appendRow(st.draft);
     if (!r.ok) {
+      st.lastNote = `Ошибка записи: ${r.error || "unknown"}`;
       await updateScreen(ctx, st, kbMain(true));
       return;
     }
 
-    st.lastNote = `${st.draft.whom} внес ${money(st.draft.amount)} сегодня.`;
+    st.lastNote = `${st.draft.whom} внес ${st.draft.amount} сегодня.`;
     st.draft = null;
     st.step = null;
     await draftClear(userId);
@@ -356,11 +357,12 @@ bot.on("text", async (ctx) => {
 
     const r = await appendRow(st.draft);
     if (!r.ok) {
+      st.lastNote = `Ошибка записи: ${r.error || "unknown"}`;
       await updateScreen(ctx, st, kbMain(true));
       return;
     }
 
-    st.lastNote = `Записано сегодня: ${money(st.draft.amount)}.`;
+    st.lastNote = `Записано сегодня: ${st.draft.amount}.`;
     st.draft = null;
     st.step = null;
     await draftClear(userId);
