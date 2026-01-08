@@ -117,6 +117,13 @@ bot.on("callback_query", async (ctx) => {
   await ctx.answerCbQuery("Ок");
   await ctx.editMessageText(`Группа: ${s.group}\nТеперь напиши: За что? (например: “пленка на склад”)`);
 });
+import http from "http";
+
+const port = process.env.PORT || 10000;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("ok");
+}).listen(port);
 
 bot.launch();
 console.log("Bot started");
