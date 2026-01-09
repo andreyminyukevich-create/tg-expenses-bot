@@ -136,12 +136,8 @@ async function getStats(period) {
   });
 }
 
-function typeLabel(t) {
-  return t === "expense" ? "Затраты" : t === "revenue" ? "Выручка" : "—";
-}
-
 function promptText(step, d) {
-  if (!d?.type) return "Нажмите «Внести транзакцию».";
+  if (step === "type") return "Выберите тип транзакции:";
   
   if (step === "amount") {
     return d.type === "revenue" 
@@ -150,52 +146,70 @@ function promptText(step, d) {
   }
   
   if (step === "whom") {
-    const a = d.amount ?? "—";
+    const a = formatNumber(d.amount);
     return d.type === "revenue"
-      ? `👤 От кого получили ${a}?`
-      : `👤 Кому заплатили ${a}?`;
+      ? `👤 От кого получили ${a} ₽?`
+      : `👤 Кому заплатили ${a} ₽?`;
   }
   
-  if (step === "group") return "📁 Выберите группу.";
+  if (step === "group") return "📁 Выберите группу:";
   if (step === "what") return "📋 За что?";
   
-  return "—";
+  return "";
 }
 
-function renderScreen(st) {
-  const d = st.draft || {};
-  const date = d.date || todayDDMMYYYY();
+async function renderMainScreen() {
+  const [todayStats, monthStats] = await Promise.all([
+    getStats("today"),
+    getStats("month")
+  ]);
 
   const lines = [];
-  lines.push(`<b>Транзакция</b>`);
-  lines.push(`Тип: <b>${htmlEscape(typeLabel(d.type))}</b>`);
-  lines.push(`Дата: <b>${htmlEscape(date)}</b>`);
-  lines.push(`Сумма: <b>${htmlEscape(d.amount ?? "—")}</b>`);
-  lines.push(`Контрагент: <b>${htmlEscape(d.whom || "—")}</b>`);
-  lines.push(`Группа: <b>${htmlEscape(d.type === "expense" ? (d.group || "—") : "—")}</b>`);
-  lines.push(`За что: <b>${htmlEscape(d.type === "expense" ? (d.what || "—") : "—")}</b>`);
-  lines.push("");
-  if (st.lastNote) lines.push(`✅ ${htmlEscape(st.lastNote)}\n`);
-  lines.push(`➡️ ${htmlEscape(promptText(st.step, d))}`);
+  
+  // Отчёт за сегодня
+  if (todayStats.ok) {
+    const tRevenue = todayStats.revenue || 0;
+    const tExpense = todayStats.expense || 0;
+    const tBalance = tRevenue - tExpense;
+    const tSign = tBalance >= 0 ? "+" : "";
+    
+    lines.push(`📊 <b>ИТОГИ ЗА СЕГОДНЯ (${todayStats.date || todayDDMMYYYY()})</b>`);
+    lines.push(`💰 Выручка: ${formatNumber(tRevenue)} ₽`);
+    lines.push(`💸 Затраты: ${formatNumber(tExpense)} ₽`);
+    lines.push(`━━━━━━━━━━━━━━━━━`);
+    lines.push(`📈 Баланс: ${tSign}${formatNumber(tBalance)} ₽`);
+    lines.push("");
+  }
+  
+  // Отчёт за месяц
+  if (monthStats.ok) {
+    const mRevenue = monthStats.revenue || 0;
+    const mExpense = monthStats.expense || 0;
+    const mBalance = mRevenue - mExpense;
+    const mSign = mBalance >= 0 ? "+" : "";
+    
+    lines.push(`📅 <b>ИТОГИ ЗА ${(monthStats.monthName || "МЕСЯЦ").toUpperCase()}</b>`);
+    lines.push(`💰 Выручка: ${formatNumber(mRevenue)} ₽`);
+    lines.push(`💸 Затраты: ${formatNumber(mExpense)} ₽`);
+    lines.push(`━━━━━━━━━━━━━━━━━`);
+    lines.push(`📈 Баланс: ${mSign}${formatNumber(mBalance)} ₽`);
+    
+    if (monthStats.topGroups && monthStats.topGroups.length > 0) {
+      lines.push("");
+      lines.push(`🔝 <b>Топ затрат:</b>`);
+      monthStats.topGroups.forEach((g, i) => {
+        lines.push(`${i + 1}. ${htmlEscape(g.group)} — ${formatNumber(g.amount)} ₽`);
+      });
+    }
+  }
 
   return lines.join("\n");
 }
 
-function kbMain(hasDraft) {
-  const rows = [
-    [Markup.button.callback("Внести транзакцию", "start")],
-    [
-      Markup.button.callback("📊 За сегодня", "stats:today"),
-      Markup.button.callback("📅 За месяц", "stats:month")
-    ]
-  ];
-  if (hasDraft) {
-    rows.push([
-      Markup.button.callback("Продолжить", "resume"), 
-      Markup.button.callback("Сбросить", "reset")
-    ]);
-  }
-  return Markup.inlineKeyboard(rows);
+function kbMain() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Внести транзакцию", "start")]
+  ]);
 }
 
 function kbType() {
@@ -204,7 +218,7 @@ function kbType() {
       Markup.button.callback("Затраты", "t:expense"), 
       Markup.button.callback("Выручка", "t:revenue")
     ],
-    [Markup.button.callback("Сбросить", "reset")],
+    [Markup.button.callback("Отмена", "cancel")],
   ]);
 }
 
@@ -217,8 +231,14 @@ function kbGroups() {
     }
     rows.push(row);
   }
-  rows.push([Markup.button.callback("Сбросить", "reset")]);
+  rows.push([Markup.button.callback("Отмена", "cancel")]);
   return Markup.inlineKeyboard(rows);
+}
+
+function kbCancel() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Отмена", "cancel")]
+  ]);
 }
 
 function nextStep(d) {
@@ -235,7 +255,7 @@ function ensureState(ctx) {
   let st = sessions.get(userId);
 
   if (!st) {
-    st = { screenId: null, draft: null, step: null, lastNote: null, lastActivity: Date.now() };
+    st = { screenId: null, draft: null, step: null, lastActivity: Date.now() };
     sessions.set(userId, st);
   }
   
@@ -243,29 +263,48 @@ function ensureState(ctx) {
   return st;
 }
 
-async function ensureScreen(ctx, st) {
-  if (st.screenId) return;
-
-  const msg = await ctx.reply(renderScreen(st), {
+async function showMainScreen(ctx, st) {
+  const text = await renderMainScreen();
+  
+  if (st.screenId) {
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        st.screenId,
+        undefined,
+        text,
+        { parse_mode: "HTML", ...kbMain() }
+      );
+      return;
+    } catch {
+      st.screenId = null;
+    }
+  }
+  
+  const msg = await ctx.reply(text, {
     parse_mode: "HTML",
-    ...kbMain(!!st.draft),
+    ...kbMain(),
   });
   st.screenId = msg.message_id;
 }
 
-async function updateScreen(ctx, st, keyboard) {
-  await ensureScreen(ctx, st);
+async function showPrompt(ctx, st, keyboard) {
+  const text = promptText(st.step, st.draft);
+  
   try {
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       st.screenId,
       undefined,
-      renderScreen(st),
+      text,
       { parse_mode: "HTML", ...keyboard }
     );
   } catch {
-    st.screenId = null;
-    await ensureScreen(ctx, st);
+    const msg = await ctx.reply(text, {
+      parse_mode: "HTML",
+      ...keyboard,
+    });
+    st.screenId = msg.message_id;
   }
 }
 
@@ -277,87 +316,26 @@ const bot = new Telegraf(BOT_TOKEN);
 
 bot.start(async (ctx) => {
   const st = ensureState(ctx);
-  await updateScreen(ctx, st, kbMain(!!st.draft));
+  await showMainScreen(ctx, st);
 });
 
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const st = ensureState(ctx);
 
-  // Обработка статистики
-  if (data === "stats:today" || data === "stats:month") {
-    const period = data.split(":")[1];
-    await ctx.answerCbQuery("⏳ Загружаю данные...");
-    
-    const r = await getStats(period);
-    
-    if (!r.ok) {
-      await ctx.reply(`❌ ${randomError("networkError")}`);
-      return;
-    }
-    
-    const revenue = r.revenue || 0;
-    const expense = r.expense || 0;
-    const balance = revenue - expense;
-    const sign = balance >= 0 ? "+" : "";
-    
-    if (period === "today") {
-      const msg = `📊 <b>Итоги за сегодня (${r.date || todayDDMMYYYY()})</b>
-
-💰 Выручка: ${formatNumber(revenue)} ₽
-💸 Затраты: ${formatNumber(expense)} ₽
-━━━━━━━━━━━━━━━━━
-📈 Баланс: ${sign}${formatNumber(balance)} ₽`;
-      
-      await ctx.reply(msg, { parse_mode: "HTML" });
-    } else {
-      let msg = `📊 <b>Итоги за ${r.monthName || "месяц"}</b>
-
-💰 Выручка: ${formatNumber(revenue)} ₽
-💸 Затраты: ${formatNumber(expense)} ₽
-━━━━━━━━━━━━━━━━━
-📈 Баланс: ${sign}${formatNumber(balance)} ₽`;
-
-      if (r.topGroups && r.topGroups.length > 0) {
-        msg += "\n\n🔝 <b>Топ затрат:</b>\n";
-        r.topGroups.forEach((g, i) => {
-          msg += `${i + 1}. ${htmlEscape(g.group)} — ${formatNumber(g.amount)} ₽\n`;
-        });
-      }
-      
-      await ctx.reply(msg, { parse_mode: "HTML" });
-    }
-    return;
-  }
-
   if (data === "start") {
-    st.lastNote = null;
     st.draft = { date: todayDDMMYYYY() };
     st.step = "type";
     await ctx.answerCbQuery();
-    await updateScreen(ctx, st, kbType());
+    await showPrompt(ctx, st, kbType());
     return;
   }
 
-  if (data === "resume") {
-    if (!st.draft) {
-      await ctx.answerCbQuery("🤷‍♂️ Нет черновика");
-      await updateScreen(ctx, st, kbMain(false));
-      return;
-    }
-    st.step = st.step || nextStep(st.draft);
-    await ctx.answerCbQuery();
-    if (!st.draft.type) return updateScreen(ctx, st, kbType());
-    if (st.step === "group") return updateScreen(ctx, st, kbGroups());
-    return updateScreen(ctx, st, kbMain(true));
-  }
-
-  if (data === "reset") {
+  if (data === "cancel") {
     st.draft = null;
     st.step = null;
-    st.lastNote = null;
-    await ctx.answerCbQuery("🧹 Всё чисто!");
-    await updateScreen(ctx, st, kbMain(false));
+    await ctx.answerCbQuery("Отменено");
+    await showMainScreen(ctx, st);
     return;
   }
 
@@ -368,7 +346,7 @@ bot.on("callback_query", async (ctx) => {
     st.draft.date = todayDDMMYYYY();
     st.step = "amount";
     await ctx.answerCbQuery();
-    await updateScreen(ctx, st, kbMain(true));
+    await showPrompt(ctx, st, kbCancel());
     return;
   }
 
@@ -385,7 +363,7 @@ bot.on("callback_query", async (ctx) => {
     st.draft.group = GROUPS[idx];
     st.step = "what";
     await ctx.answerCbQuery();
-    await updateScreen(ctx, st, kbMain(true));
+    await showPrompt(ctx, st, kbCancel());
     return;
   }
 
@@ -396,7 +374,7 @@ bot.on("text", async (ctx) => {
   const st = ensureState(ctx);
   const text = ctx.message.text.trim();
 
-  // === АВТООТЧЁТ ===
+  // АВТООТЧЁТ
   if (text.startsWith("/auto_report:")) {
     const parts = text.split(":");
     if (parts.length < 2) return;
@@ -427,10 +405,9 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  // === ОБЫЧНАЯ ЛОГИКА ===
-  if (!st.draft || !st.step || st.step === "type") {
+  // ОБЫЧНАЯ ЛОГИКА
+  if (!st.draft || !st.step) {
     await tryDeleteUserMessage(ctx);
-    await updateScreen(ctx, st, kbMain(!!st.draft));
     return;
   }
 
@@ -440,21 +417,19 @@ bot.on("text", async (ctx) => {
     if (!Number.isFinite(val)) {
       await tryDeleteUserMessage(ctx);
       await ctx.reply(randomError("invalidAmount"));
-      setTimeout(() => updateScreen(ctx, st, kbMain(true)), 1500);
       return;
     }
     
     if (val <= 0 || val > 999999999) {
       await tryDeleteUserMessage(ctx);
       await ctx.reply(randomError("tooLarge"));
-      setTimeout(() => updateScreen(ctx, st, kbMain(true)), 1500);
       return;
     }
     
     st.draft.amount = val;
     st.step = "whom";
     await tryDeleteUserMessage(ctx);
-    await updateScreen(ctx, st, kbMain(true));
+    await showPrompt(ctx, st, kbCancel());
     return;
   }
 
@@ -462,7 +437,6 @@ bot.on("text", async (ctx) => {
     if (text.length > 500) {
       await tryDeleteUserMessage(ctx);
       await ctx.reply(randomError("tooLong"));
-      setTimeout(() => updateScreen(ctx, st, kbMain(true)), 1500);
       return;
     }
     
@@ -471,23 +445,23 @@ bot.on("text", async (ctx) => {
     if (st.draft.type === "expense") {
       st.step = "group";
       await tryDeleteUserMessage(ctx);
-      await updateScreen(ctx, st, kbGroups());
+      await showPrompt(ctx, st, kbGroups());
       return;
     }
 
+    // ВЫРУЧКА - сохраняем
     await tryDeleteUserMessage(ctx);
-
     const r = await appendRow(st.draft);
+    
     if (!r.ok) {
-      st.lastNote = `❌ ${randomError("networkError")}`;
-      await updateScreen(ctx, st, kbMain(true));
+      await ctx.reply(`❌ ${randomError("networkError")}`);
       return;
     }
 
-    st.lastNote = `${st.draft.whom} внес ${st.draft.amount} сегодня.`;
+    await ctx.reply(`✅ ${st.draft.whom} внес ${formatNumber(st.draft.amount)} ₽ сегодня.`);
     st.draft = null;
     st.step = null;
-    await updateScreen(ctx, st, kbMain(false));
+    await showMainScreen(ctx, st);
     return;
   }
 
@@ -495,7 +469,6 @@ bot.on("text", async (ctx) => {
     if (text.length > 500) {
       await tryDeleteUserMessage(ctx);
       await ctx.reply(randomError("tooLong"));
-      setTimeout(() => updateScreen(ctx, st, kbMain(true)), 1500);
       return;
     }
     
@@ -503,21 +476,20 @@ bot.on("text", async (ctx) => {
     await tryDeleteUserMessage(ctx);
 
     const r = await appendRow(st.draft);
+    
     if (!r.ok) {
-      st.lastNote = `❌ ${randomError("networkError")}`;
-      await updateScreen(ctx, st, kbMain(true));
+      await ctx.reply(`❌ ${randomError("networkError")}`);
       return;
     }
 
-    st.lastNote = `Записано сегодня: ${st.draft.amount}.`;
+    await ctx.reply(`✅ Записано сегодня: ${formatNumber(st.draft.amount)} ₽.`);
     st.draft = null;
     st.step = null;
-    await updateScreen(ctx, st, kbMain(false));
+    await showMainScreen(ctx, st);
     return;
   }
 
   await tryDeleteUserMessage(ctx);
-  await updateScreen(ctx, st, kbMain(true));
 });
 
 bot.launch();
