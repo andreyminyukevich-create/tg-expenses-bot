@@ -136,6 +136,29 @@ async function getStats(period) {
   });
 }
 
+async function getTransactionsToday(type) {
+  return await api({
+    action: "transactions_today",
+    type: type,
+  });
+}
+
+async function getTransactionsByGroup(group, period) {
+  return await api({
+    action: "transactions_by_group",
+    group: group,
+    period: period,
+  });
+}
+
+async function getTopPayers(period, limit) {
+  return await api({
+    action: "top_payers",
+    period: period,
+    limit: limit || 20,
+  });
+}
+
 function promptText(step, d) {
   if (step === "type") return "Выберите тип транзакции:";
   
@@ -166,7 +189,6 @@ async function renderMainScreen() {
 
   const lines = [];
   
-  // Отчёт за сегодня
   if (todayStats.ok) {
     const tRevenue = todayStats.revenue || 0;
     const tExpense = todayStats.expense || 0;
@@ -181,7 +203,6 @@ async function renderMainScreen() {
     lines.push("");
   }
   
-  // Отчёт за месяц
   if (monthStats.ok) {
     const mRevenue = monthStats.revenue || 0;
     const mExpense = monthStats.expense || 0;
@@ -208,7 +229,18 @@ async function renderMainScreen() {
 
 function kbMain() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("Внести транзакцию", "start")]
+    [Markup.button.callback("Внести транзакцию", "start")],
+    [Markup.button.callback("📊 Аналитика", "analytics")]
+  ]);
+}
+
+function kbAnalytics() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Затраты за сегодня", "analytics:expenses_today")],
+    [Markup.button.callback("Поступления за сегодня", "analytics:revenue_today")],
+    [Markup.button.callback("Затраты по группам", "analytics:by_group")],
+    [Markup.button.callback("Топ плательщиков", "analytics:top_payers")],
+    [Markup.button.callback("← Назад", "back_to_main")]
   ]);
 }
 
@@ -235,9 +267,37 @@ function kbGroups() {
   return Markup.inlineKeyboard(rows);
 }
 
+function kbGroupsAnalytics() {
+  const rows = [];
+  for (let i = 0; i < GROUPS.length; i += 2) {
+    const row = [];
+    for (let j = 0; j < 2 && i + j < GROUPS.length; j++) {
+      row.push(Markup.button.callback(GROUPS[i + j], `analytics:group:${i + j}`));
+    }
+    rows.push(row);
+  }
+  rows.push([Markup.button.callback("← Назад", "analytics")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function kbTopPayersPeriod() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("За сегодня", "analytics:top:today")],
+    [Markup.button.callback("За неделю", "analytics:top:week")],
+    [Markup.button.callback("За месяц", "analytics:top:month")],
+    [Markup.button.callback("← Назад", "analytics")]
+  ]);
+}
+
 function kbCancel() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Отмена", "cancel")]
+  ]);
+}
+
+function kbBackToAnalytics() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("← Назад", "analytics")]
   ]);
 }
 
@@ -288,6 +348,26 @@ async function showMainScreen(ctx, st) {
   st.screenId = msg.message_id;
 }
 
+async function showAnalyticsMenu(ctx, st) {
+  const text = "📊 <b>АНАЛИТИКА</b>\n\nВыберите тип отчёта:";
+  
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      text,
+      { parse_mode: "HTML", ...kbAnalytics() }
+    );
+  } catch {
+    const msg = await ctx.reply(text, {
+      parse_mode: "HTML",
+      ...kbAnalytics(),
+    });
+    st.screenId = msg.message_id;
+  }
+}
+
 async function showPrompt(ctx, st, keyboard) {
   const text = promptText(st.step, st.draft);
   
@@ -323,6 +403,204 @@ bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data || "";
   const st = ensureState(ctx);
 
+  // === АНАЛИТИКА ===
+  if (data === "analytics") {
+    await ctx.answerCbQuery();
+    await showAnalyticsMenu(ctx, st);
+    return;
+  }
+
+  if (data === "back_to_main") {
+    await ctx.answerCbQuery();
+    await showMainScreen(ctx, st);
+    return;
+  }
+
+  if (data === "analytics:expenses_today") {
+    await ctx.answerCbQuery("⏳ Загружаю...");
+    const r = await getTransactionsToday("expense");
+    
+    if (!r.ok || !r.transactions || r.transactions.length === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        st.screenId,
+        undefined,
+        "💸 <b>ЗАТРАТЫ ЗА СЕГОДНЯ</b>\n\nПусто",
+        { parse_mode: "HTML", ...kbBackToAnalytics() }
+      );
+      return;
+    }
+    
+    let total = 0;
+    const lines = [`💸 <b>ЗАТРАТЫ ЗА СЕГОДНЯ (${r.date})</b>\n`];
+    
+    r.transactions.forEach((t, i) => {
+      total += t.amount;
+      const group = t.group ? ` — ${t.group}` : "";
+      const what = t.what ? ` — ${t.what}` : "";
+      lines.push(`${i + 1}. ${htmlEscape(t.whom)} — ${formatNumber(t.amount)} ₽${group}${what}`);
+    });
+    
+    lines.push(`\n<b>Всего: ${formatNumber(total)} ₽</b>`);
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      lines.join("\n"),
+      { parse_mode: "HTML", ...kbBackToAnalytics() }
+    );
+    return;
+  }
+
+  if (data === "analytics:revenue_today") {
+    await ctx.answerCbQuery("⏳ Загружаю...");
+    const r = await getTransactionsToday("revenue");
+    
+    if (!r.ok || !r.transactions || r.transactions.length === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        st.screenId,
+        undefined,
+        "💰 <b>ПОСТУПЛЕНИЯ ЗА СЕГОДНЯ</b>\n\nПусто",
+        { parse_mode: "HTML", ...kbBackToAnalytics() }
+      );
+      return;
+    }
+    
+    let total = 0;
+    const lines = [`💰 <b>ПОСТУПЛЕНИЯ ЗА СЕГОДНЯ (${r.date})</b>\n`];
+    
+    r.transactions.forEach((t, i) => {
+      total += t.amount;
+      lines.push(`${i + 1}. ${htmlEscape(t.whom)} — ${formatNumber(t.amount)} ₽`);
+    });
+    
+    lines.push(`\n<b>Всего: ${formatNumber(total)} ₽</b>`);
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      lines.join("\n"),
+      { parse_mode: "HTML", ...kbBackToAnalytics() }
+    );
+    return;
+  }
+
+  if (data === "analytics:by_group") {
+    await ctx.answerCbQuery();
+    const text = "📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nВыберите группу:";
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      text,
+      { parse_mode: "HTML", ...kbGroupsAnalytics() }
+    );
+    return;
+  }
+
+  if (data.startsWith("analytics:group:")) {
+    const idx = Number(data.split(":")[2]);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= GROUPS.length) {
+      await ctx.answerCbQuery("Ошибка");
+      return;
+    }
+    
+    const group = GROUPS[idx];
+    await ctx.answerCbQuery("⏳ Загружаю...");
+    
+    const r = await getTransactionsByGroup(group, "month");
+    
+    if (!r.ok || !r.transactions || r.transactions.length === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        st.screenId,
+        undefined,
+        `📁 <b>${htmlEscape(group).toUpperCase()}</b>\n\nНет транзакций за текущий месяц`,
+        { parse_mode: "HTML", ...kbBackToAnalytics() }
+      );
+      return;
+    }
+    
+    let total = 0;
+    const lines = [`📁 <b>${htmlEscape(group).toUpperCase()}</b>\n`];
+    
+    r.transactions.forEach((t, i) => {
+      total += t.amount;
+      const what = t.what ? ` — ${t.what}` : "";
+      lines.push(`${i + 1}. ${t.date} | ${htmlEscape(t.whom)} — ${formatNumber(t.amount)} ₽${what}`);
+    });
+    
+    lines.push(`\n<b>Всего: ${formatNumber(total)} ₽</b>`);
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      lines.join("\n"),
+      { parse_mode: "HTML", ...kbBackToAnalytics() }
+    );
+    return;
+  }
+
+  if (data === "analytics:top_payers") {
+    await ctx.answerCbQuery();
+    const text = "🏆 <b>ТОП ПЛАТЕЛЬЩИКОВ</b>\n\nВыберите период:";
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      text,
+      { parse_mode: "HTML", ...kbTopPayersPeriod() }
+    );
+    return;
+  }
+
+  if (data.startsWith("analytics:top:")) {
+    const period = data.split(":")[2];
+    await ctx.answerCbQuery("⏳ Загружаю...");
+    
+    const r = await getTopPayers(period, 20);
+    
+    if (!r.ok || !r.payers || r.payers.length === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        st.screenId,
+        undefined,
+        `🏆 <b>ТОП ПЛАТЕЛЬЩИКОВ</b>\n\nНет данных за выбранный период`,
+        { parse_mode: "HTML", ...kbBackToAnalytics() }
+      );
+      return;
+    }
+    
+    const periodName = period === "today" ? "СЕГОДНЯ" : period === "week" ? "НЕДЕЛЮ" : "МЕСЯЦ";
+    let grandTotal = 0;
+    
+    const lines = [`🏆 <b>ТОП-20 ПЛАТЕЛЬЩИКОВ ЗА ${periodName}</b>\n`];
+    
+    r.payers.forEach((p, i) => {
+      grandTotal += p.total;
+      const count = p.count > 1 ? ` (${p.count} платежей)` : "";
+      lines.push(`${i + 1}. ${htmlEscape(p.name)} — ${formatNumber(p.total)} ₽${count}`);
+    });
+    
+    lines.push(`\n<b>Всего от топ-${r.payers.length}: ${formatNumber(grandTotal)} ₽</b>`);
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      st.screenId,
+      undefined,
+      lines.join("\n"),
+      { parse_mode: "HTML", ...kbBackToAnalytics() }
+    );
+    return;
+  }
+
+  // === ТРАНЗАКЦИИ ===
   if (data === "start") {
     st.draft = { date: todayDDMMYYYY() };
     st.step = "type";
@@ -461,6 +739,9 @@ bot.on("text", async (ctx) => {
     await ctx.reply(`✅ ${st.draft.whom} внес ${formatNumber(st.draft.amount)} ₽ сегодня.`);
     st.draft = null;
     st.step = null;
+    
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
     await showMainScreen(ctx, st);
     return;
   }
@@ -485,6 +766,9 @@ bot.on("text", async (ctx) => {
     await ctx.reply(`✅ Записано сегодня: ${formatNumber(st.draft.amount)} ₽.`);
     st.draft = null;
     st.step = null;
+    
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
     await showMainScreen(ctx, st);
     return;
   }
