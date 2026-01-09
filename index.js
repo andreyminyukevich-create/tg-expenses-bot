@@ -326,28 +326,21 @@ function ensureState(ctx) {
 async function showMainScreen(ctx, st) {
   const text = await renderMainScreen();
   
+  // Удаляем старый экран если был
   if (st.screenId) {
     try {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        st.screenId,
-        undefined,
-        text,
-        { parse_mode: "HTML", ...kbMain() }
-      );
-      return;
-    } catch {
-      st.screenId = null;
-    }
+      await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId);
+    } catch {}
+    st.screenId = null;
   }
   
+  // Создаём новый (всегда последний)
   const msg = await ctx.reply(text, {
     parse_mode: "HTML",
     ...kbMain(),
   });
   st.screenId = msg.message_id;
 }
-
 async function showAnalyticsMenu(ctx, st) {
   const text = "📊 <b>АНАЛИТИКА</b>\n\nВыберите тип отчёта:";
   
