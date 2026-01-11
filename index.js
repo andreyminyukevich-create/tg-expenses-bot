@@ -6,9 +6,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SCRIPT_URL = process.env.SCRIPT_URL;
 const TOKEN = process.env.TOKEN;
 const TIMEZONE = process.env.TIMEZONE || "Europe/Amsterdam";
-
-// Доступ только владельцу (строго):
-// OWNER_ID = твой Telegram user id (число), например 123456789
 const OWNER_ID = process.env.OWNER_ID ? String(process.env.OWNER_ID).trim() : "";
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
@@ -120,7 +117,7 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
-// Умный парсер суммы. Возвращает:
+// Умный парсер суммы.
 // { ok:true, value:number } или { ok:false, reason:"invalid"|"ambiguous", options?:number[] }
 function parseAmountSmart(inputRaw) {
   let s = String(inputRaw ?? "").trim();
@@ -130,8 +127,6 @@ function parseAmountSmart(inputRaw) {
   s = s.replace(/[\s'’`]/g, ""); // пробелы/апострофы как разделители тысяч
 
   if (!s) return { ok: false, reason: "invalid" };
-
-  // минус не принимаем
   if (s.includes("-")) return { ok: false, reason: "invalid" };
 
   const hasDot = s.includes(".");
@@ -247,11 +242,12 @@ async function getGroupTotals(period) {
 }
 
 async function getTopPayers(period, limit) {
-  return await api({
-    action: "top_payers",
-    period,
-    limit: limit || 20,
-  });
+  return await api({ action: "top_payers", period, limit: limit || 20 });
+}
+
+// НОВОЕ: полный список транзакций по типу за период (today/month/year)
+async function getTransactions(type, period) {
+  return await api({ action: "transactions", type, period });
 }
 
 // ===== UI TEXT =====
@@ -380,7 +376,6 @@ async function denyAccess(ctx) {
 // ===== RENDER =====
 async function renderMainScreen() {
   const [monthStats, topYear] = await Promise.all([getStats("month"), getTopPayers("year", 3)]);
-
   const lines = [];
 
   if (monthStats.ok) {
@@ -400,7 +395,6 @@ async function renderMainScreen() {
 
   lines.push("");
   lines.push("🏆 <b>Топ-3 плательщика за год</b>");
-
   if (topYear.ok && Array.isArray(topYear.payers) && topYear.payers.length) {
     topYear.payers.slice(0, 3).forEach((p, i) => {
       lines.push(`${i + 1}. ${htmlEscape(p.name)} — ${formatMoneyRu(p.total)} ₽`);
@@ -456,6 +450,52 @@ async function tryDeleteUserMessage(ctx) {
   try {
     await ctx.deleteMessage();
   } catch {}
+}
+
+// ===== REPORT RENDERERS =====
+function periodLabel(period, meta) {
+  if (period === "today") return `сегодня (${meta?.date || todayDDMMYYYY()})`;
+  if (period === "month") return meta?.monthName ? `в ${String(meta.monthName).toUpperCase()}` : "в этом месяце";
+  if (period === "year") return meta?.year ? `в ${meta.year} году` : "в этом году";
+  return period;
+}
+
+function renderTransactionsList(title, period, meta, items, type) {
+  // type: "expense" | "revenue"
+  const lines = [];
+  lines.push(`${title}`);
+  lines.push(`Период: <b>${htmlEscape(periodLabel(period, meta))}</b>`);
+  lines.push("");
+
+  if (!items.length) {
+    lines.push("Пусто");
+    return lines.join("\n");
+  }
+
+  let total = 0;
+
+  items.forEach((t, i) => {
+    const amt = Number(t.amount) || 0;
+    total += amt;
+
+    const date = htmlEscape(t.date || "");
+    const whom = htmlEscape(t.whom || "");
+    const group = htmlEscape(t.group || "");
+    const what = htmlEscape(t.what || "");
+
+    if (type === "expense") {
+      const extra = [group, what].filter(Boolean).join(" — ");
+      lines.push(`${i + 1}. ${date} | ${whom} — <b>${formatMoneyRu(amt)} ₽</b>${extra ? ` — ${extra}` : ""}`);
+    } else {
+      // revenue
+      lines.push(`${i + 1}. ${date} | ${whom} — <b>${formatMoneyRu(amt)} ₽</b>`);
+    }
+  });
+
+  lines.push("");
+  lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
+
+  return lines.join("\n");
 }
 
 // ===== BOT =====
@@ -533,14 +573,15 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  // Затраты / Поступления: today/month/year
+  // ===== АНАЛИТИКА: ЗАТРАТЫ/ПОСТУПЛЕНИЯ (ПОЛНЫЙ СПИСОК) =====
   if (data.startsWith("an:exp:") || data.startsWith("an:rev:")) {
-    const [_, kind, period] = data.split(":");
+    const [_, kind, period] = data.split(":"); // an, exp|rev, today|month|year
     await ctx.answerCbQuery("⏳ Загружаю...");
 
-    const r = await getStats(period);
+    const type = kind === "exp" ? "expense" : "revenue";
+    const tr = await getTransactions(type, period);
 
-    if (!r.ok) {
+    if (!tr.ok) {
       await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, `❌ ${randomError("networkError")}`, {
         parse_mode: "HTML",
         ...kbBackToAnalytics(),
@@ -548,21 +589,20 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
 
+    // meta для подписи периода
+    const meta = {};
+    if (period === "today") meta.date = todayDDMMYYYY();
+    if (period === "month") {
+      // попробуем аккуратно получить monthName через stats, чтобы красиво подписать
+      const s = await getStats("month");
+      if (s?.ok) meta.monthName = s.monthName;
+    }
+    if (period === "year") meta.year = new Date().getFullYear();
+
+    const items = Array.isArray(tr.transactions) ? tr.transactions : [];
+
     const title = kind === "exp" ? "💸 <b>ЗАТРАТЫ</b>" : "💰 <b>ПОСТУПЛЕНИЯ</b>";
-
-    const periodLabel =
-      period === "today"
-        ? `за сегодня (${r.date || todayDDMMYYYY()})`
-        : period === "month"
-          ? `за ${String(r.monthName || "текущий месяц").toUpperCase()}`
-          : `за ${r.year || new Date().getFullYear()} год`;
-
-    const value = kind === "exp" ? (r.expense || 0) : (r.revenue || 0);
-
-    const text =
-      `${title}\n\n` +
-      `Период: <b>${htmlEscape(periodLabel)}</b>\n` +
-      `Сумма: <b>${formatMoneyRu(value)} ₽</b>`;
+    const text = renderTransactionsList(title, period, meta, items, type);
 
     await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
       parse_mode: "HTML",
@@ -571,7 +611,7 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  // Затраты по группам: today/month/year (списком)
+  // ===== АНАЛИТИКА: ЗАТРАТЫ ПО ГРУППАМ (СПИСОК СУММ) =====
   if (data.startsWith("an:groups:")) {
     const period = data.split(":")[2];
     await ctx.answerCbQuery("⏳ Загружаю...");
@@ -586,7 +626,7 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
 
-    const periodLabel =
+    const periodText =
       period === "today" ? `сегодня (${todayDDMMYYYY()})` : period === "month" ? "в этом месяце" : "в этом году";
 
     const items = Array.isArray(r.items) ? r.items : [];
@@ -595,7 +635,7 @@ bot.on("callback_query", async (ctx) => {
         ctx.chat.id,
         st.screenId,
         undefined,
-        `📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nПериод: <b>${htmlEscape(periodLabel)}</b>\n\nПусто`,
+        `📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
       return;
@@ -603,11 +643,17 @@ bot.on("callback_query", async (ctx) => {
 
     const lines = [];
     lines.push(`📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>`);
-    lines.push(`Период: <b>${htmlEscape(periodLabel)}</b>`);
+    lines.push(`Период: <b>${htmlEscape(periodText)}</b>`);
     lines.push("");
+
+    let total = 0;
     items.forEach((it, i) => {
+      total += Number(it.amount) || 0;
       lines.push(`${i + 1}. ${htmlEscape(it.group)} — <b>${formatMoneyRu(it.amount)} ₽</b>`);
     });
+
+    lines.push("");
+    lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
     await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, lines.join("\n"), {
       parse_mode: "HTML",
@@ -616,7 +662,7 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  // Оплаты: today/month/year (плательщики списком)
+  // ===== АНАЛИТИКА: ОПЛАТЫ (ПЛАТЕЛЬЩИКИ) =====
   if (data.startsWith("an:payers:")) {
     const period = data.split(":")[2];
     await ctx.answerCbQuery("⏳ Загружаю...");
@@ -631,7 +677,7 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
 
-    const periodLabel =
+    const periodText =
       period === "today" ? `сегодня (${todayDDMMYYYY()})` : period === "month" ? "в этом месяце" : "в этом году";
 
     const payers = Array.isArray(r.payers) ? r.payers : [];
@@ -640,7 +686,7 @@ bot.on("callback_query", async (ctx) => {
         ctx.chat.id,
         st.screenId,
         undefined,
-        `🏆 <b>ОПЛАТЫ</b>\n\nПериод: <b>${htmlEscape(periodLabel)}</b>\n\nПусто`,
+        `🏆 <b>ОПЛАТЫ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
       return;
@@ -648,12 +694,18 @@ bot.on("callback_query", async (ctx) => {
 
     const lines = [];
     lines.push(`🏆 <b>ОПЛАТЫ</b>`);
-    lines.push(`Период: <b>${htmlEscape(periodLabel)}</b>`);
+    lines.push(`Период: <b>${htmlEscape(periodText)}</b>`);
     lines.push("");
+
+    let total = 0;
     payers.forEach((p, i) => {
+      total += Number(p.total) || 0;
       const cnt = p.count > 1 ? ` (${p.count})` : "";
       lines.push(`${i + 1}. ${htmlEscape(p.name)} — <b>${formatMoneyRu(p.total)} ₽</b>${cnt}`);
     });
+
+    lines.push("");
+    lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
     await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, lines.join("\n"), {
       parse_mode: "HTML",
