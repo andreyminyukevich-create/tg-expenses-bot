@@ -117,6 +117,23 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
+// Безопасное редактирование сообщения (если не получается - отправляет новое)
+async function safeEditMessage(ctx, st, text, extra = {}) {
+  try {
+    // Пытаемся отредактировать через ctx (он знает message_id из callback_query)
+    await ctx.editMessageText(text, extra);
+  } catch (error) {
+    // Если сообщение удалено или не найдено - отправляем новое
+    if (error.description?.includes("message to edit not found") || 
+        error.description?.includes("message is not modified")) {
+      const sent = await ctx.reply(text, extra);
+      st.screenId = sent.message_id;
+    } else {
+      throw error; // другие ошибки пробрасываем дальше
+    }
+  }
+}
+
 // Умный парсер суммы.
 // { ok:true, value:number } или { ok:false, reason:"invalid"|"ambiguous", options?:number[] }
 function parseAmountSmart(inputRaw) {
@@ -422,28 +439,18 @@ async function showMainScreen(ctx, st) {
 
 async function showAnalyticsMenu(ctx, st) {
   const text = "📊 <b>АНАЛИТИКА</b>\n\nВыберите раздел:";
-  try {
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
-      parse_mode: "HTML",
-      ...kbAnalyticsMain(),
-    });
-  } catch {
-    const msg = await ctx.reply(text, { parse_mode: "HTML", ...kbAnalyticsMain() });
-    st.screenId = msg.message_id;
-  }
+  await safeEditMessage(ctx, st, text, {
+    parse_mode: "HTML",
+    ...kbAnalyticsMain(),
+  });
 }
 
 async function showPrompt(ctx, st, keyboard) {
   const text = promptText(st.step, st.draft);
-  try {
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
-      parse_mode: "HTML",
-      ...keyboard,
-    });
-  } catch {
-    const msg = await ctx.reply(text, { parse_mode: "HTML", ...keyboard });
-    st.screenId = msg.message_id;
-  }
+  await safeEditMessage(ctx, st, text, {
+    parse_mode: "HTML",
+    ...keyboard,
+  });
 }
 
 async function tryDeleteUserMessage(ctx) {
@@ -536,7 +543,7 @@ bot.on("callback_query", async (ctx) => {
   if (data === "an:exp") {
     await ctx.answerCbQuery();
     const text = "💸 <b>ЗАТРАТЫ</b>\n\nВыберите период:";
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
+    await safeEditMessage(ctx, st, text, {
       parse_mode: "HTML",
       ...kbPeriods("an:exp"),
     });
@@ -546,7 +553,7 @@ bot.on("callback_query", async (ctx) => {
   if (data === "an:rev") {
     await ctx.answerCbQuery();
     const text = "💰 <b>ПОСТУПЛЕНИЯ</b>\n\nВыберите период:";
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
+    await safeEditMessage(ctx, st, text, {
       parse_mode: "HTML",
       ...kbPeriods("an:rev"),
     });
@@ -556,7 +563,7 @@ bot.on("callback_query", async (ctx) => {
   if (data === "an:groups") {
     await ctx.answerCbQuery();
     const text = "📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nВыберите период:";
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
+    await safeEditMessage(ctx, st, text, {
       parse_mode: "HTML",
       ...kbPeriods("an:groups"),
     });
@@ -566,7 +573,7 @@ bot.on("callback_query", async (ctx) => {
   if (data === "an:payers") {
     await ctx.answerCbQuery();
     const text = "🏆 <b>ОПЛАТЫ</b>\n\nВыберите период:";
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
+    await safeEditMessage(ctx, st, text, {
       parse_mode: "HTML",
       ...kbPeriods("an:payers"),
     });
@@ -582,7 +589,7 @@ bot.on("callback_query", async (ctx) => {
     const tr = await getTransactions(type, period);
 
     if (!tr.ok) {
-      await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, `❌ ${randomError("networkError")}`, {
+      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
         parse_mode: "HTML",
         ...kbBackToAnalytics(),
       });
@@ -604,7 +611,7 @@ bot.on("callback_query", async (ctx) => {
     const title = kind === "exp" ? "💸 <b>ЗАТРАТЫ</b>" : "💰 <b>ПОСТУПЛЕНИЯ</b>";
     const text = renderTransactionsList(title, period, meta, items, type);
 
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, text, {
+    await safeEditMessage(ctx, st, text, {
       parse_mode: "HTML",
       ...kbBackToAnalytics(),
     });
@@ -619,7 +626,7 @@ bot.on("callback_query", async (ctx) => {
     const r = await getGroupTotals(period);
 
     if (!r.ok) {
-      await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, `❌ ${randomError("networkError")}`, {
+      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
         parse_mode: "HTML",
         ...kbBackToAnalytics(),
       });
@@ -631,10 +638,9 @@ bot.on("callback_query", async (ctx) => {
 
     const items = Array.isArray(r.items) ? r.items : [];
     if (!items.length) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        st.screenId,
-        undefined,
+      await safeEditMessage(
+        ctx,
+        st,
         `📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
@@ -655,7 +661,7 @@ bot.on("callback_query", async (ctx) => {
     lines.push("");
     lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, lines.join("\n"), {
+    await safeEditMessage(ctx, st, lines.join("\n"), {
       parse_mode: "HTML",
       ...kbBackToAnalytics(),
     });
@@ -670,7 +676,7 @@ bot.on("callback_query", async (ctx) => {
     const r = await getTopPayers(period, 50);
 
     if (!r.ok) {
-      await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, `❌ ${randomError("networkError")}`, {
+      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
         parse_mode: "HTML",
         ...kbBackToAnalytics(),
       });
@@ -682,10 +688,9 @@ bot.on("callback_query", async (ctx) => {
 
     const payers = Array.isArray(r.payers) ? r.payers : [];
     if (!payers.length) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        st.screenId,
-        undefined,
+      await safeEditMessage(
+        ctx,
+        st,
         `🏆 <b>ОПЛАТЫ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
@@ -707,7 +712,7 @@ bot.on("callback_query", async (ctx) => {
     lines.push("");
     lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
-    await ctx.telegram.editMessageText(ctx.chat.id, st.screenId, undefined, lines.join("\n"), {
+    await safeEditMessage(ctx, st, lines.join("\n"), {
       parse_mode: "HTML",
       ...kbBackToAnalytics(),
     });
@@ -777,10 +782,9 @@ bot.on("callback_query", async (ctx) => {
     const r = await appendRow(st.draft);
 
     if (!r.ok) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        st.screenId,
-        undefined,
+      await safeEditMessage(
+        ctx,
+        st,
         `❌ ${randomError("networkError")}\n\nМожем попробовать ещё раз.`,
         { parse_mode: "HTML", ...kbRetrySend() }
       );
@@ -931,3 +935,7 @@ bot.on("text", async (ctx) => {
 
 bot.launch();
 console.log("Bot started");
+
+// Graceful shutdown для Railway
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
