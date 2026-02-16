@@ -123,9 +123,16 @@ async function safeEditMessage(ctx, st, text, extra = {}) {
     // Пытаемся отредактировать через ctx (он знает message_id из callback_query)
     await ctx.editMessageText(text, extra);
   } catch (error) {
-    // Если сообщение удалено или не найдено - отправляем новое
+    // Если сообщение удалено или не найдено - удаляем старое и отправляем новое
     if (error.description?.includes("message to edit not found") || 
         error.description?.includes("message is not modified")) {
+      // Удаляем старое сообщение
+      if (st.screenId) {
+        try {
+          await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId);
+        } catch {}
+      }
+      // Отправляем новое
       const sent = await ctx.reply(text, extra);
       st.screenId = sent.message_id;
     } else {
@@ -447,10 +454,20 @@ async function showAnalyticsMenu(ctx, st) {
 
 async function showPrompt(ctx, st, keyboard) {
   const text = promptText(st.step, st.draft);
-  await safeEditMessage(ctx, st, text, {
+  
+  // Удаляем старое сообщение с вопросом
+  if (st.screenId) {
+    try {
+      await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId);
+    } catch {}
+  }
+  
+  // Отправляем новое
+  const msg = await ctx.reply(text, {
     parse_mode: "HTML",
     ...keyboard,
   });
+  st.screenId = msg.message_id;
 }
 
 async function tryDeleteUserMessage(ctx) {
