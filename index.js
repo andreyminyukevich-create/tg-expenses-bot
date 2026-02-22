@@ -354,11 +354,11 @@ function kbConfirm() {
 
 function kbAnalyticsMain() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("💸 Затраты",            "an:exp")],
-    [Markup.button.callback("💰 Поступления",        "an:rev")],
-    [Markup.button.callback("📁 Затраты по группам", "an:groups")],
-    [Markup.button.callback("🏆 Оплаты",             "an:payers")],
-    [Markup.button.callback("← Назад",               "back_to_main")],
+    [Markup.button.callback("💸 Затраты",                  "an:exp")],
+    [Markup.button.callback("📁 Затраты по группам",       "an:groups")],
+    [Markup.button.callback("💰 Оплаты все",               "an:rev")],
+    [Markup.button.callback("🏆 Оплаты по контрагентам",   "an:payers")],
+    [Markup.button.callback("← Назад",                     "back_to_main")],
   ]);
 }
 
