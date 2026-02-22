@@ -133,12 +133,12 @@ function daysAgo(n) {
 // ===== API =====
 async function api(payload) {
   const body = JSON.stringify({ token: TOKEN, ...payload });
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
 
   try {
-    // Первый запрос без авто-редиректа — GAS делает 302 и нам нужно повторить POST
+    // GAS делает 302-редирект, Node.js при авто-следовании меняет POST→GET → 405
+    // Поэтому первый запрос без авто-редиректа, потом вручную повторяем POST
     const res = await fetch(SCRIPT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -147,7 +147,6 @@ async function api(payload) {
       signal: controller.signal,
     });
 
-    // GAS делает 302-редирект, повторяем POST вручную на новый URL
     const location = res.headers.get("location");
     if ([301, 302, 307, 308].includes(res.status) && location) {
       const res2 = await fetch(location, {
