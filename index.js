@@ -5,7 +5,7 @@ import { Telegraf, Markup } from "telegraf";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SCRIPT_URL = process.env.SCRIPT_URL;
 const TOKEN = process.env.TOKEN;
-const TIMEZONE = process.env.TIMEZONE || "Europe/Amsterdam";
+const TIMEZONE = process.env.TIMEZONE || "Europe/Moscow";
 const OWNER_ID = process.env.OWNER_ID ? String(process.env.OWNER_ID).trim() : "";
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
@@ -13,7 +13,7 @@ if (!SCRIPT_URL) throw new Error("SCRIPT_URL missing");
 if (!TOKEN) throw new Error("TOKEN missing");
 if (!OWNER_ID) throw new Error("OWNER_ID missing (set your Telegram user id in env)");
 if (typeof fetch !== "function") {
-  throw new Error("Global fetch() not found. Use Node.js 18+ or add a fetch polyfill.");
+  throw new Error("Global fetch() not found. Use Node.js 18+.");
 }
 
 // ===== CONSTS =====
@@ -34,6 +34,8 @@ const GROUPS = [
   "ИИ",
 ];
 
+const API_TIMEOUT_MS = 15_000;
+
 const sessions = new Map();
 const SESSION_TTL = 30 * 60 * 1000;
 
@@ -46,9 +48,9 @@ const ERRORS = {
     "🤔 Либо я глупый, либо это не деньги. Скорее второе",
   ],
   tooLarge: [
-    "😱 Воу-воу! Миллиард? Я конечно рад за вас, но давайте реальнее",
-    "🚀 Космические суммы! Но давайте что-то до миллиарда",
-    "💰 Ого! А может все-таки что-то поскромнее?",
+    "😱 Воу-воу! Миллиард? Давайте что-то до миллиарда",
+    "🚀 Космические суммы! Попробуйте поскромнее",
+    "💰 Ого! А может всё-таки что-то поменьше?",
     "🤑 Красиво, но нереально. Попробуйте меньше миллиарда",
   ],
   tooLong: [
@@ -62,6 +64,11 @@ const ERRORS = {
     "📡 Связь с космосом потеряна. Повторите попытку",
     "🔌 Что-то с сетью... Попробуем еще раз?",
     "🛰️ Хьюстон, у нас проблемы! Давайте по новой",
+  ],
+  timeout: [
+    "⏱️ Таблица долго не отвечает. Попробуйте ещё раз",
+    "🐌 GAS завис... Попробуйте через пару секунд",
+    "⏰ Время ожидания вышло. Повторите попытку",
   ],
 };
 
@@ -89,13 +96,13 @@ function htmlEscape(s) {
     .replaceAll("/", "&#x2F;");
 }
 
-function todayDDMMYYYY() {
+function todayDDMMYYYY(dateObj = new Date()) {
   const parts = new Intl.DateTimeFormat("ru-RU", {
     timeZone: TIMEZONE,
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
-  }).formatToParts(new Date());
+  }).formatToParts(dateObj);
 
   const dd = parts.find((p) => p.type === "day")?.value;
   const mm = parts.find((p) => p.type === "month")?.value;
@@ -103,7 +110,6 @@ function todayDDMMYYYY() {
   return `${dd}.${mm}.${yyyy}`;
 }
 
-// формат "* *,**" => 1 234,56
 function formatMoneyRu(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return "0,00";
@@ -117,38 +123,100 @@ function round2(n) {
   return Math.round(Number(n) * 100) / 100;
 }
 
-// Безопасное редактирование сообщения (если не получается - отправляет новое)
-async function safeEditMessage(ctx, st, text, extra = {}) {
+// Дата N дней назад
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return todayDDMMYYYY(d);
+}
+
+// ===== API =====
+async function api(payload) {
+  const body = JSON.stringify({ token: TOKEN, ...payload });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
   try {
-    // Пытаемся отредактировать через ctx (он знает message_id из callback_query)
-    await ctx.editMessageText(text, extra);
-  } catch (error) {
-    // Если сообщение удалено или не найдено - удаляем старое и отправляем новое
-    if (error.description?.includes("message to edit not found") || 
-        error.description?.includes("message is not modified")) {
-      // Удаляем старое сообщение
-      if (st.screenId) {
-        try {
-          await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId);
-        } catch {}
-      }
-      // Отправляем новое
-      const sent = await ctx.reply(text, extra);
-      st.screenId = sent.message_id;
-    } else {
-      throw error; // другие ошибки пробрасываем дальше
+    // Первый запрос без авто-редиректа — GAS делает 302 и нам нужно повторить POST
+    const res = await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+
+    // GAS делает 302-редирект, повторяем POST вручную на новый URL
+    const location = res.headers.get("location");
+    if ([301, 302, 307, 308].includes(res.status) && location) {
+      const res2 = await fetch(location, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: controller.signal,
+      });
+      const text = await res2.text();
+      console.log(`[GAS] ${payload.action} → ${res2.status}: ${text.slice(0, 300)}`);
+      try { return JSON.parse(text); }
+      catch { return { ok: false, error: `Non-JSON (${res2.status}): ${text.slice(0, 200)}` }; }
     }
+
+    const text = await res.text();
+    console.log(`[GAS] ${payload.action} → ${res.status}: ${text.slice(0, 300)}`);
+    try { return JSON.parse(text); }
+    catch { return { ok: false, error: `Non-JSON (${res.status}): ${text.slice(0, 200)}` }; }
+
+  } catch (err) {
+    if (err.name === "AbortError") {
+      console.error(`[GAS] TIMEOUT after ${API_TIMEOUT_MS}ms: ${payload.action}`);
+      return { ok: false, error: "timeout" };
+    }
+    console.error(`[GAS] FETCH ERROR: ${err.message}`);
+    return { ok: false, error: err.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Умный парсер суммы.
-// { ok:true, value:number } или { ok:false, reason:"invalid"|"ambiguous", options?:number[] }
+// ===== API CALLS =====
+async function appendRow(d) {
+  return await api({
+    action: "append",
+    type: d.type,
+    date: d.date,
+    amount: d.amount,
+    whom: d.whom,
+    group: d.group || "",
+    what: d.what || "",
+  });
+}
+
+async function deleteLastRow() {
+  return await api({ action: "delete_last" });
+}
+
+async function getStats(period) {
+  return await api({ action: "stats", period });
+}
+
+async function getGroupTotals(period) {
+  return await api({ action: "group_totals", period });
+}
+
+async function getTopPayers(period, limit) {
+  return await api({ action: "top_payers", period, limit: limit || 20 });
+}
+
+async function getTransactions(type, period) {
+  return await api({ action: "transactions", type, period });
+}
+
+// ===== AMOUNT PARSER =====
 function parseAmountSmart(inputRaw) {
   let s = String(inputRaw ?? "").trim();
-
-  // убираем валюты/буквы, оставляем цифры/разделители/минус
-  s = s.replace(/[^\d.,\s'’`-]/g, "");
-  s = s.replace(/[\s'’`]/g, ""); // пробелы/апострофы как разделители тысяч
+  s = s.replace(/[^\d.,\s''`-]/g, "");
+  s = s.replace(/[\s''`]/g, "");
 
   if (!s) return { ok: false, reason: "invalid" };
   if (s.includes("-")) return { ok: false, reason: "invalid" };
@@ -174,7 +242,6 @@ function parseAmountSmart(inputRaw) {
     return round2(v);
   };
 
-  // есть и точка и запятая: десятичный — последний из них
   if (hasDot && hasComma) {
     const dec = s.lastIndexOf(".") > s.lastIndexOf(",") ? "." : ",";
     const val = toNum(s, dec);
@@ -216,8 +283,8 @@ function parseAmountSmart(inputRaw) {
   }
 
   if (right.length === 3) {
-    const asThousands = toNum(s, null); // 1234
-    const asDecimal = toNum(s, sep); // 1.234
+    const asThousands = toNum(s, null);
+    const asDecimal = toNum(s, sep);
     if (!Number.isFinite(asThousands) || !Number.isFinite(asDecimal)) {
       return { ok: false, reason: "invalid" };
     }
@@ -229,54 +296,10 @@ function parseAmountSmart(inputRaw) {
   return { ok: true, value: val };
 }
 
-async function api(payload) {
-  const res = await fetch(SCRIPT_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token: TOKEN, ...payload }),
-  });
-
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { ok: false, error: `Non-JSON response (${res.status}): ${text.slice(0, 200)}` };
-  }
-}
-
-// ===== API CALLS =====
-async function appendRow(d) {
-  return await api({
-    action: "append",
-    type: d.type,
-    date: d.date,
-    amount: d.amount,
-    whom: d.whom,
-    group: d.group,
-    what: d.what,
-  });
-}
-
-async function getStats(period) {
-  return await api({ action: "stats", period });
-}
-
-async function getGroupTotals(period) {
-  return await api({ action: "group_totals", period });
-}
-
-async function getTopPayers(period, limit) {
-  return await api({ action: "top_payers", period, limit: limit || 20 });
-}
-
-// НОВОЕ: полный список транзакций по типу за период (today/month/year)
-async function getTransactions(type, period) {
-  return await api({ action: "transactions", type, period });
-}
-
 // ===== UI TEXT =====
 function promptText(step, d) {
   if (step === "type") return "Выберите тип транзакции:";
+  if (step === "date") return "📅 Выберите дату или введите в формате ДД.ММ.ГГГГ:";
 
   if (step === "amount") {
     return d.type === "revenue"
@@ -290,11 +313,34 @@ function promptText(step, d) {
 
   if (step === "whom") {
     const a = formatMoneyRu(d.amount);
-    return d.type === "revenue" ? `👤 От кого получили ${a} ₽?` : `👤 Кому заплатили ${a} ₽?`;
+    const dateLabel = d.date !== todayDDMMYYYY() ? ` (${d.date})` : "";
+    return d.type === "revenue"
+      ? `💰 Записываю: <b>${a} ₽</b>${dateLabel}\n\n👤 От кого получили?`
+      : `💸 Записываю: <b>${a} ₽</b>${dateLabel}\n\n👤 Кому заплатили?`;
   }
 
   if (step === "group") return "📁 Выберите группу:";
+
   if (step === "what") return "📋 За что?";
+
+  if (step === "confirm") {
+    const d2 = d;
+    const type = d2.type === "revenue" ? "Выручка" : "Затраты";
+    const icon = d2.type === "revenue" ? "💰" : "💸";
+    const lines = [
+      `${icon} <b>Подтвердите запись:</b>`,
+      ``,
+      `📅 Дата: <b>${htmlEscape(d2.date)}</b>`,
+      `💵 Сумма: <b>${formatMoneyRu(d2.amount)} ₽</b>`,
+      `👤 ${d2.type === "revenue" ? "От кого" : "Кому"}: <b>${htmlEscape(d2.whom)}</b>`,
+    ];
+    if (d2.type === "expense") {
+      if (d2.group) lines.push(`📁 Группа: <b>${htmlEscape(d2.group)}</b>`);
+      if (d2.what) lines.push(`📋 За что: <b>${htmlEscape(d2.what)}</b>`);
+    }
+    lines.push(`🏷 Тип: <b>${type}</b>`);
+    return lines.join("\n");
+  }
 
   return "";
 }
@@ -302,14 +348,27 @@ function promptText(step, d) {
 // ===== KEYBOARDS =====
 function kbMain() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("Внести транзакцию", "start")],
+    [Markup.button.callback("➕ Внести транзакцию", "start")],
+    [Markup.button.callback("↩️ Отменить последнюю", "undo_last")],
     [Markup.button.callback("📊 Аналитика", "an")],
   ]);
 }
 
 function kbType() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("Затраты", "t:expense"), Markup.button.callback("Выручка", "t:revenue")],
+    [Markup.button.callback("💸 Затраты", "t:expense"), Markup.button.callback("💰 Выручка", "t:revenue")],
+    [Markup.button.callback("Отмена", "cancel")],
+  ]);
+}
+
+function kbDate() {
+  const today = todayDDMMYYYY();
+  const yesterday = daysAgo(1);
+  const twoDaysAgo = daysAgo(2);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`Сегодня (${today})`, `d:${today}`)],
+    [Markup.button.callback(`Вчера (${yesterday})`, `d:${yesterday}`)],
+    [Markup.button.callback(`${twoDaysAgo}`, `d:${twoDaysAgo}`)],
     [Markup.button.callback("Отмена", "cancel")],
   ]);
 }
@@ -348,7 +407,12 @@ function kbAmountAmbiguous(options) {
   ]);
 }
 
-// === Аналитика ===
+function kbConfirm() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Записать", "confirm_send"), Markup.button.callback("❌ Отмена", "cancel")],
+  ]);
+}
+
 function kbAnalyticsMain() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("💸 Затраты", "an:exp")],
@@ -454,26 +518,38 @@ async function showAnalyticsMenu(ctx, st) {
 
 async function showPrompt(ctx, st, keyboard) {
   const text = promptText(st.step, st.draft);
-  
-  // Удаляем старое сообщение с вопросом
+
   if (st.screenId) {
     try {
       await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId);
     } catch {}
   }
-  
-  // Отправляем новое
-  const msg = await ctx.reply(text, {
-    parse_mode: "HTML",
-    ...keyboard,
-  });
+
+  const msg = await ctx.reply(text, { parse_mode: "HTML", ...keyboard });
   st.screenId = msg.message_id;
 }
 
-async function tryDeleteUserMessage(ctx) {
+async function safeEditMessage(ctx, st, text, extra = {}) {
   try {
-    await ctx.deleteMessage();
-  } catch {}
+    await ctx.editMessageText(text, extra);
+  } catch (error) {
+    if (
+      error.description?.includes("message to edit not found") ||
+      error.description?.includes("message is not modified")
+    ) {
+      if (st.screenId) {
+        try { await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId); } catch {}
+      }
+      const sent = await ctx.reply(text, extra);
+      st.screenId = sent.message_id;
+    } else {
+      throw error;
+    }
+  }
+}
+
+async function tryDeleteUserMessage(ctx) {
+  try { await ctx.deleteMessage(); } catch {}
 }
 
 // ===== REPORT RENDERERS =====
@@ -485,9 +561,8 @@ function periodLabel(period, meta) {
 }
 
 function renderTransactionsList(title, period, meta, items, type) {
-  // type: "expense" | "revenue"
   const lines = [];
-  lines.push(`${title}`);
+  lines.push(title);
   lines.push(`Период: <b>${htmlEscape(periodLabel(period, meta))}</b>`);
   lines.push("");
 
@@ -511,7 +586,6 @@ function renderTransactionsList(title, period, meta, items, type) {
       const extra = [group, what].filter(Boolean).join(" — ");
       lines.push(`${i + 1}. ${date} | ${whom} — <b>${formatMoneyRu(amt)} ₽</b>${extra ? ` — ${extra}` : ""}`);
     } else {
-      // revenue
       lines.push(`${i + 1}. ${date} | ${whom} — <b>${formatMoneyRu(amt)} ₽</b>`);
     }
   });
@@ -542,6 +616,7 @@ bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery?.data || "";
   const st = ensureState(ctx);
 
+  // ===== НАВИГАЦИЯ =====
   if (data === "back_to_main") {
     await ctx.answerCbQuery();
     st.draft = null;
@@ -557,10 +632,28 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
+  // ===== ОТМЕНА ПОСЛЕДНЕЙ ЗАПИСИ =====
+  if (data === "undo_last") {
+    await ctx.answerCbQuery("⏳ Отменяю...");
+    const r = await deleteLastRow();
+    if (r.ok) {
+      if (st.screenId) {
+        try { await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId); } catch {}
+        st.screenId = null;
+      }
+      // Показываем сообщение об успехе и обновляем главный экран
+      await ctx.reply("✅ Последняя запись удалена.");
+      await showMainScreen(ctx, st);
+    } else {
+      await ctx.answerCbQuery(`❌ Не удалось: ${r.error || "ошибка"}`, { show_alert: true });
+    }
+    return;
+  }
+
+  // ===== АНАЛИТИКА =====
   if (data === "an:exp") {
     await ctx.answerCbQuery();
-    const text = "💸 <b>ЗАТРАТЫ</b>\n\nВыберите период:";
-    await safeEditMessage(ctx, st, text, {
+    await safeEditMessage(ctx, st, "💸 <b>ЗАТРАТЫ</b>\n\nВыберите период:", {
       parse_mode: "HTML",
       ...kbPeriods("an:exp"),
     });
@@ -569,8 +662,7 @@ bot.on("callback_query", async (ctx) => {
 
   if (data === "an:rev") {
     await ctx.answerCbQuery();
-    const text = "💰 <b>ПОСТУПЛЕНИЯ</b>\n\nВыберите период:";
-    await safeEditMessage(ctx, st, text, {
+    await safeEditMessage(ctx, st, "💰 <b>ПОСТУПЛЕНИЯ</b>\n\nВыберите период:", {
       parse_mode: "HTML",
       ...kbPeriods("an:rev"),
     });
@@ -579,8 +671,7 @@ bot.on("callback_query", async (ctx) => {
 
   if (data === "an:groups") {
     await ctx.answerCbQuery();
-    const text = "📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nВыберите период:";
-    await safeEditMessage(ctx, st, text, {
+    await safeEditMessage(ctx, st, "📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nВыберите период:", {
       parse_mode: "HTML",
       ...kbPeriods("an:groups"),
     });
@@ -589,8 +680,7 @@ bot.on("callback_query", async (ctx) => {
 
   if (data === "an:payers") {
     await ctx.answerCbQuery();
-    const text = "🏆 <b>ОПЛАТЫ</b>\n\nВыберите период:";
-    await safeEditMessage(ctx, st, text, {
+    await safeEditMessage(ctx, st, "🏆 <b>ОПЛАТЫ</b>\n\nВыберите период:", {
       parse_mode: "HTML",
       ...kbPeriods("an:payers"),
     });
@@ -599,43 +689,37 @@ bot.on("callback_query", async (ctx) => {
 
   // ===== АНАЛИТИКА: ЗАТРАТЫ/ПОСТУПЛЕНИЯ (ПОЛНЫЙ СПИСОК) =====
   if (data.startsWith("an:exp:") || data.startsWith("an:rev:")) {
-    const [_, kind, period] = data.split(":"); // an, exp|rev, today|month|year
+    const parts = data.split(":");
+    const kind = parts[1];
+    const period = parts[2];
     await ctx.answerCbQuery("⏳ Загружаю...");
 
     const type = kind === "exp" ? "expense" : "revenue";
     const tr = await getTransactions(type, period);
 
     if (!tr.ok) {
-      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
-        parse_mode: "HTML",
-        ...kbBackToAnalytics(),
-      });
+      const errMsg = tr.error === "timeout" ? randomError("timeout") : randomError("networkError");
+      await safeEditMessage(ctx, st, `❌ ${errMsg}`, { parse_mode: "HTML", ...kbBackToAnalytics() });
       return;
     }
 
-    // meta для подписи периода
     const meta = {};
     if (period === "today") meta.date = todayDDMMYYYY();
     if (period === "month") {
-      // попробуем аккуратно получить monthName через stats, чтобы красиво подписать
       const s = await getStats("month");
       if (s?.ok) meta.monthName = s.monthName;
     }
     if (period === "year") meta.year = new Date().getFullYear();
 
     const items = Array.isArray(tr.transactions) ? tr.transactions : [];
-
     const title = kind === "exp" ? "💸 <b>ЗАТРАТЫ</b>" : "💰 <b>ПОСТУПЛЕНИЯ</b>";
     const text = renderTransactionsList(title, period, meta, items, type);
 
-    await safeEditMessage(ctx, st, text, {
-      parse_mode: "HTML",
-      ...kbBackToAnalytics(),
-    });
+    await safeEditMessage(ctx, st, text, { parse_mode: "HTML", ...kbBackToAnalytics() });
     return;
   }
 
-  // ===== АНАЛИТИКА: ЗАТРАТЫ ПО ГРУППАМ (СПИСОК СУММ) =====
+  // ===== АНАЛИТИКА: ЗАТРАТЫ ПО ГРУППАМ =====
   if (data.startsWith("an:groups:")) {
     const period = data.split(":")[2];
     await ctx.answerCbQuery("⏳ Загружаю...");
@@ -643,10 +727,8 @@ bot.on("callback_query", async (ctx) => {
     const r = await getGroupTotals(period);
 
     if (!r.ok) {
-      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
-        parse_mode: "HTML",
-        ...kbBackToAnalytics(),
-      });
+      const errMsg = r.error === "timeout" ? randomError("timeout") : randomError("networkError");
+      await safeEditMessage(ctx, st, `❌ ${errMsg}`, { parse_mode: "HTML", ...kbBackToAnalytics() });
       return;
     }
 
@@ -656,8 +738,7 @@ bot.on("callback_query", async (ctx) => {
     const items = Array.isArray(r.items) ? r.items : [];
     if (!items.length) {
       await safeEditMessage(
-        ctx,
-        st,
+        ctx, st,
         `📁 <b>ЗАТРАТЫ ПО ГРУППАМ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
@@ -678,14 +759,11 @@ bot.on("callback_query", async (ctx) => {
     lines.push("");
     lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
-    await safeEditMessage(ctx, st, lines.join("\n"), {
-      parse_mode: "HTML",
-      ...kbBackToAnalytics(),
-    });
+    await safeEditMessage(ctx, st, lines.join("\n"), { parse_mode: "HTML", ...kbBackToAnalytics() });
     return;
   }
 
-  // ===== АНАЛИТИКА: ОПЛАТЫ (ПЛАТЕЛЬЩИКИ) =====
+  // ===== АНАЛИТИКА: ОПЛАТЫ =====
   if (data.startsWith("an:payers:")) {
     const period = data.split(":")[2];
     await ctx.answerCbQuery("⏳ Загружаю...");
@@ -693,10 +771,8 @@ bot.on("callback_query", async (ctx) => {
     const r = await getTopPayers(period, 50);
 
     if (!r.ok) {
-      await safeEditMessage(ctx, st, `❌ ${randomError("networkError")}`, {
-        parse_mode: "HTML",
-        ...kbBackToAnalytics(),
-      });
+      const errMsg = r.error === "timeout" ? randomError("timeout") : randomError("networkError");
+      await safeEditMessage(ctx, st, `❌ ${errMsg}`, { parse_mode: "HTML", ...kbBackToAnalytics() });
       return;
     }
 
@@ -706,8 +782,7 @@ bot.on("callback_query", async (ctx) => {
     const payers = Array.isArray(r.payers) ? r.payers : [];
     if (!payers.length) {
       await safeEditMessage(
-        ctx,
-        st,
+        ctx, st,
         `🏆 <b>ОПЛАТЫ</b>\n\nПериод: <b>${htmlEscape(periodText)}</b>\n\nПусто`,
         { parse_mode: "HTML", ...kbBackToAnalytics() }
       );
@@ -729,10 +804,7 @@ bot.on("callback_query", async (ctx) => {
     lines.push("");
     lines.push(`Итого: <b>${formatMoneyRu(total)} ₽</b>`);
 
-    await safeEditMessage(ctx, st, lines.join("\n"), {
-      parse_mode: "HTML",
-      ...kbBackToAnalytics(),
-    });
+    await safeEditMessage(ctx, st, lines.join("\n"), { parse_mode: "HTML", ...kbBackToAnalytics() });
     return;
   }
 
@@ -760,6 +832,18 @@ bot.on("callback_query", async (ctx) => {
     st.draft = st.draft || {};
     st.draft.type = type;
     st.draft.date = todayDDMMYYYY();
+    st.step = "date";
+    st.tmp = {};
+    await ctx.answerCbQuery();
+    await showPrompt(ctx, st, kbDate());
+    return;
+  }
+
+  // Выбор даты кнопкой
+  if (data.startsWith("d:")) {
+    if (!st.draft) { await ctx.answerCbQuery("Неактуально"); return; }
+    const date = data.slice(2);
+    st.draft.date = date;
     st.step = "amount";
     st.tmp = {};
     await ctx.answerCbQuery();
@@ -789,32 +873,6 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
-  if (data === "retry_send") {
-    if (!st.draft) {
-      await ctx.answerCbQuery("Нечего отправлять");
-      return;
-    }
-    await ctx.answerCbQuery("⏳ Пытаюсь отправить...");
-
-    const r = await appendRow(st.draft);
-
-    if (!r.ok) {
-      await safeEditMessage(
-        ctx,
-        st,
-        `❌ ${randomError("networkError")}\n\nМожем попробовать ещё раз.`,
-        { parse_mode: "HTML", ...kbRetrySend() }
-      );
-      return;
-    }
-
-    st.draft = null;
-    st.step = null;
-    st.tmp = {};
-    await showMainScreen(ctx, st);
-    return;
-  }
-
   if (data.startsWith("g:")) {
     if (!st.draft || st.draft.type !== "expense") {
       await ctx.answerCbQuery("🤔 А что вносим-то?");
@@ -832,6 +890,84 @@ bot.on("callback_query", async (ctx) => {
     return;
   }
 
+  // Подтверждение записи
+  if (data === "confirm_send") {
+    if (!st.draft) {
+      await ctx.answerCbQuery("Нечего отправлять");
+      return;
+    }
+    await ctx.answerCbQuery("⏳ Записываю...");
+
+    const r = await appendRow(st.draft);
+
+    if (!r.ok) {
+      const errMsg = r.error === "timeout" ? randomError("timeout") : randomError("networkError");
+      await safeEditMessage(ctx, st, `❌ ${errMsg}\n\nМожем попробовать ещё раз.`, {
+        parse_mode: "HTML",
+        ...kbRetrySend(),
+      });
+      return;
+    }
+
+    const saved = { ...st.draft };
+    st.draft = null;
+    st.step = null;
+    st.tmp = {};
+
+    if (st.screenId) {
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId); } catch {}
+      st.screenId = null;
+    }
+
+    const icon = saved.type === "revenue" ? "💰" : "💸";
+    await ctx.reply(
+      `${icon} Записано: <b>${formatMoneyRu(saved.amount)} ₽</b> — ${htmlEscape(saved.whom)} (${htmlEscape(saved.date)})`,
+      { parse_mode: "HTML" }
+    );
+
+    await showMainScreen(ctx, st);
+    return;
+  }
+
+  // Повтор отправки при ошибке
+  if (data === "retry_send") {
+    if (!st.draft) {
+      await ctx.answerCbQuery("Нечего отправлять");
+      return;
+    }
+    await ctx.answerCbQuery("⏳ Пытаюсь отправить...");
+
+    const r = await appendRow(st.draft);
+
+    if (!r.ok) {
+      const errMsg = r.error === "timeout" ? randomError("timeout") : randomError("networkError");
+      await safeEditMessage(ctx, st, `❌ ${errMsg}\n\nМожем попробовать ещё раз.`, {
+        parse_mode: "HTML",
+        ...kbRetrySend(),
+      });
+      return;
+    }
+
+    const saved = { ...st.draft };
+    st.draft = null;
+    st.step = null;
+    st.tmp = {};
+
+    if (st.screenId) {
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId); } catch {}
+      st.screenId = null;
+    }
+
+    const icon = saved.type === "revenue" ? "💰" : "💸";
+    await ctx.reply(
+      `${icon} Записано: <b>${formatMoneyRu(saved.amount)} ₽</b> — ${htmlEscape(saved.whom)} (${htmlEscape(saved.date)})`,
+      { parse_mode: "HTML" }
+    );
+
+    await showMainScreen(ctx, st);
+    return;
+  }
+
   await ctx.answerCbQuery();
 });
 
@@ -841,6 +977,22 @@ bot.on("text", async (ctx) => {
 
   if (!st.draft || !st.step) {
     await tryDeleteUserMessage(ctx);
+    return;
+  }
+
+  // Ввод даты вручную
+  if (st.step === "date") {
+    const dateRegex = /^\d{2}\.\d{2}\.\d{4}$/;
+    if (!dateRegex.test(text)) {
+      await tryDeleteUserMessage(ctx);
+      await ctx.reply("📅 Введите дату в формате ДД.ММ.ГГГГ, например: 15.02.2025");
+      return;
+    }
+    st.draft.date = text;
+    st.step = "amount";
+    st.tmp = {};
+    await tryDeleteUserMessage(ctx);
+    await showPrompt(ctx, st, kbCancel());
     return;
   }
 
@@ -892,23 +1044,10 @@ bot.on("text", async (ctx) => {
       return;
     }
 
+    // Для выручки — сразу на подтверждение
+    st.step = "confirm";
     await tryDeleteUserMessage(ctx);
-    const r = await appendRow(st.draft);
-
-    if (!r.ok) {
-      await ctx.reply(`❌ ${randomError("networkError")}`, kbRetrySend());
-      return;
-    }
-
-    await ctx.reply(`✅ ${htmlEscape(st.draft.whom)} внёс ${formatMoneyRu(st.draft.amount)} ₽ сегодня.`, {
-      parse_mode: "HTML",
-    });
-
-    st.draft = null;
-    st.step = null;
-    st.tmp = {};
-
-    await showMainScreen(ctx, st);
+    await showPrompt(ctx, st, kbConfirm());
     return;
   }
 
@@ -920,22 +1059,9 @@ bot.on("text", async (ctx) => {
     }
 
     st.draft.what = text;
-
+    st.step = "confirm";
     await tryDeleteUserMessage(ctx);
-    const r = await appendRow(st.draft);
-
-    if (!r.ok) {
-      await ctx.reply(`❌ ${randomError("networkError")}`, kbRetrySend());
-      return;
-    }
-
-    await ctx.reply(`✅ Записано: ${formatMoneyRu(st.draft.amount)} ₽ сегодня.`);
-
-    st.draft = null;
-    st.step = null;
-    st.tmp = {};
-
-    await showMainScreen(ctx, st);
+    await showPrompt(ctx, st, kbConfirm());
     return;
   }
 
@@ -950,9 +1076,22 @@ bot.on("text", async (ctx) => {
   await tryDeleteUserMessage(ctx);
 });
 
-bot.launch();
-console.log("Bot started");
+// ===== LAUNCH с retry при 409 =====
+async function startBot(retries = 5) {
+  try {
+    await bot.launch({ dropPendingUpdates: true });
+    console.log("Bot started");
+  } catch (err) {
+    if (err.response?.error_code === 409 && retries > 0) {
+      console.log(`[409] Conflict, retry in 5s... (${retries} left)`);
+      await new Promise((r) => setTimeout(r, 5000));
+      return startBot(retries - 1);
+    }
+    throw err;
+  }
+}
 
-// Graceful shutdown для Railway
+startBot();
+
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
