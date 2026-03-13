@@ -170,6 +170,12 @@ async function getTopPayers(period, limit) {
 async function getTransactions(type, period) {
   return api({ action: "transactions", type, period });
 }
+async function getPayments() {
+  return api({ action: "payments" });
+}
+async function markPaymentPaid(day, what, whom) {
+  return api({ action: "mark_paid", day, what, whom });
+}
 
 // ===== AMOUNT PARSER =====
 function parseAmountSmart(inputRaw) {
@@ -286,12 +292,80 @@ function promptText(step, d) {
   return "";
 }
 
+// ===== PAYMENTS RENDER =====
+function renderPayments(items, total) {
+  if (!items.length) {
+    return "✅ <b>Все платежи закрыты!</b>\n\nНа этот месяц долгов нет.";
+  }
+
+  const lines = ["📅 <b>КАЛЕНДАРЬ ПЛАТЕЖЕЙ</b>", ""];
+
+  const overdue  = items.filter(p => p.diff < 0);
+  const today    = items.filter(p => p.diff === 0);
+  const soon     = items.filter(p => p.diff > 0 && p.diff <= 3);
+  const upcoming = items.filter(p => p.diff > 3);
+
+  if (overdue.length) {
+    lines.push("🔴 <b>Просрочено:</b>");
+    for (const p of overdue) {
+      lines.push(`• ${htmlEscape(p.what)} — <b>${formatMoneyRu(p.amount)} ₽</b>`);
+      lines.push(`  👤 ${htmlEscape(p.whom)} · ${Math.abs(p.diff)} дн назад`);
+    }
+    lines.push("");
+  }
+
+  if (today.length) {
+    lines.push("🟡 <b>Сегодня:</b>");
+    for (const p of today) {
+      lines.push(`• ${htmlEscape(p.what)} — <b>${formatMoneyRu(p.amount)} ₽</b>`);
+      lines.push(`  👤 ${htmlEscape(p.whom)}`);
+    }
+    lines.push("");
+  }
+
+  if (soon.length) {
+    lines.push("🟠 <b>В ближайшие 3 дня:</b>");
+    for (const p of soon) {
+      lines.push(`• ${htmlEscape(p.what)} — <b>${formatMoneyRu(p.amount)} ₽</b>`);
+      lines.push(`  👤 ${htmlEscape(p.whom)} · через ${p.diff} дн`);
+    }
+    lines.push("");
+  }
+
+  if (upcoming.length) {
+    lines.push("🟢 <b>Предстоит:</b>");
+    for (const p of upcoming) {
+      lines.push(`• ${p.date} — ${htmlEscape(p.what)} — <b>${formatMoneyRu(p.amount)} ₽</b>`);
+      lines.push(`  👤 ${htmlEscape(p.whom)}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`━━━━━━━━━━━━━━━━━`);
+  lines.push(`💰 Итого к оплате: <b>${formatMoneyRu(total)} ₽</b>`);
+
+  return lines.join("\n");
+}
+
+function kbPayments(items) {
+  // Кнопки "Оплатить" только для просроченных и сегодняшних (макс 5 кнопок)
+  const urgent = items.filter(p => p.diff <= 0).slice(0, 5);
+  const rows = urgent.map(p =>
+    [Markup.button.callback(
+      `✓ ${p.what.slice(0, 25)} ${formatMoneyRu(p.amount)} ₽`,
+      `pay:${p.day}:${encodeURIComponent(p.what)}:${encodeURIComponent(p.whom)}`
+    )]
+  );
+  rows.push([Markup.button.callback("← Главная", "back_to_main")]);
+  return Markup.inlineKeyboard(rows);
+}
+
 // ===== KEYBOARDS =====
 function kbMain() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("➕ Внести транзакцию", "start")],
     [Markup.button.callback("↩️ Отменить последнюю", "undo_last")],
-    [Markup.button.callback("📊 Аналитика", "an")],
+    [Markup.button.callback("📅 Платежи", "payments"), Markup.button.callback("📊 Аналитика", "an")],
   ]);
 }
 
@@ -540,9 +614,83 @@ bot.start(async (ctx) => {
   await showMainScreen(ctx, st);
 });
 
+// ===== КОМАНДА /платежи =====
+bot.command("платежи", async (ctx) => {
+  const st = ensureState(ctx);
+  await tryDeleteUserMessage(ctx);
+
+  const loadMsg = await ctx.reply("⏳ Загружаю платежи...");
+  const r = await getPayments();
+
+  try { await ctx.telegram.deleteMessage(ctx.chat.id, loadMsg.message_id); } catch {}
+
+  if (!r.ok) {
+    await ctx.reply(`❌ ${apiError(r)}`);
+    return;
+  }
+
+  const items = r.items || [];
+  const text  = renderPayments(items, r.total || 0);
+
+  if (st.screenId) {
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, st.screenId); } catch {}
+  }
+  const msg = await ctx.reply(text, { parse_mode: "HTML", ...kbPayments(items) });
+  st.screenId = msg.message_id;
+});
+
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery?.data || "";
   const st   = ensureState(ctx);
+
+  // ===== ОТМЕТИТЬ ОПЛАЧЕННЫМ =====
+  if (data.startsWith("pay:")) {
+    const parts = data.split(":");
+    const day   = Number(parts[1]);
+    const what  = decodeURIComponent(parts[2] || "");
+    const whom  = decodeURIComponent(parts[3] || "");
+
+    await ctx.answerCbQuery("⏳ Отмечаю...");
+
+    const r = await markPaymentPaid(day, what, whom);
+    if (!r.ok) {
+      await ctx.answerCbQuery("❌ Ошибка, попробуйте ещё раз", { show_alert: true });
+      return;
+    }
+
+    // Перезагружаем список платежей
+    const updated = await getPayments();
+    if (!updated.ok) {
+      await ctx.answerCbQuery("✅ Оплачено!", { show_alert: true });
+      return;
+    }
+
+    const items = updated.items || [];
+    const text  = renderPayments(items, updated.total || 0);
+
+    try {
+      await ctx.editMessageText(text, { parse_mode: "HTML", ...kbPayments(items) });
+    } catch {}
+
+    return;
+  }
+
+  // ===== КНОПКА ПЛАТЕЖИ НА ГЛАВНОЙ =====
+  if (data === "payments") {
+    await ctx.answerCbQuery("⏳ Загружаю...");
+
+    const r = await getPayments();
+    if (!r.ok) {
+      await ctx.answerCbQuery(apiError(r), { show_alert: true });
+      return;
+    }
+
+    const items = r.items || [];
+    const text  = renderPayments(items, r.total || 0);
+
+    await safeEditMessage(ctx, st, text, { parse_mode: "HTML", ...kbPayments(items) });
+    return;
+  }
 
   if (data === "back_to_main") {
     await ctx.answerCbQuery();
