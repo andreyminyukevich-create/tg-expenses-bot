@@ -348,15 +348,12 @@ function renderPayments(items, total) {
 }
 
 function kbPayments(items) {
-  // Кнопки "Оплатить" только для просроченных и сегодняшних (макс 5 кнопок)
-  // В callback пишем только индекс — данные берём из сессии
-  const urgent = items.filter(p => p.diff <= 0).slice(0, 5);
-  const rows = urgent.map((p, i) =>
-    [Markup.button.callback(
-      `✓ ${p.what.slice(0, 20)} ${formatMoneyRu(p.amount)} ₽`,
-      `pay:${i}`
-    )]
-  );
+  // Кнопки для всех платежей (макс 8), индекс в callback — данные из сессии
+  const rows = items.slice(0, 8).map((p, i) => {
+    const icon = p.diff < 0 ? "🔴" : p.diff === 0 ? "🟡" : p.diff <= 3 ? "🟠" : "🟢";
+    const label = `✓ ${icon} ${p.what.slice(0, 17)} ${formatMoneyRu(p.amount)} ₽`;
+    return [Markup.button.callback(label, `pay:${i}`)];
+  });
   rows.push([Markup.button.callback("← Главная", "back_to_main")]);
   return Markup.inlineKeyboard(rows);
 }
@@ -648,8 +645,8 @@ bot.on("callback_query", async (ctx) => {
   // ===== ОТМЕТИТЬ ОПЛАЧЕННЫМ =====
   if (data.startsWith("pay:")) {
     const idx = Number(data.split(":")[1]);
-    const urgentItems = (st.tmp?.paymentItems || []).filter(p => p.diff <= 0);
-    const p = urgentItems[idx];
+    const allItems = st.tmp?.paymentItems || [];
+    const p = allItems[idx];
 
     if (!p) { await ctx.answerCbQuery("Платёж не найден", { show_alert: true }); return; }
 
@@ -662,10 +659,7 @@ bot.on("callback_query", async (ctx) => {
     }
 
     const updated = await getPayments();
-    if (!updated.ok) {
-      await ctx.answerCbQuery("✅ Оплачено!", { show_alert: true });
-      return;
-    }
+    if (!updated.ok) { await ctx.answerCbQuery("✅ Оплачено!", { show_alert: true }); return; }
 
     const items = updated.items || [];
     st.tmp.paymentItems = items;
@@ -680,17 +674,17 @@ bot.on("callback_query", async (ctx) => {
 
   // ===== КНОПКА ПЛАТЕЖИ НА ГЛАВНОЙ =====
   if (data === "payments") {
-    await ctx.answerCbQuery("⏳ Загружаю...");
+    await ctx.answerCbQuery();
 
     const r = await getPayments();
     if (!r.ok) {
-      await ctx.answerCbQuery(apiError(r), { show_alert: true });
+      await safeEditMessage(ctx, st, `❌ ${apiError(r)}`, { parse_mode: "HTML" });
       return;
     }
 
     const items = r.items || [];
     st.tmp.paymentItems = items;
-    const text  = renderPayments(items, r.total || 0);
+    const text = renderPayments(items, r.total || 0);
 
     await safeEditMessage(ctx, st, text, { parse_mode: "HTML", ...kbPayments(items) });
     return;
