@@ -349,11 +349,12 @@ function renderPayments(items, total) {
 
 function kbPayments(items) {
   // Кнопки "Оплатить" только для просроченных и сегодняшних (макс 5 кнопок)
+  // В callback пишем только индекс — данные берём из сессии
   const urgent = items.filter(p => p.diff <= 0).slice(0, 5);
-  const rows = urgent.map(p =>
+  const rows = urgent.map((p, i) =>
     [Markup.button.callback(
-      `✓ ${p.what.slice(0, 25)} ${formatMoneyRu(p.amount)} ₽`,
-      `pay:${p.day}:${encodeURIComponent(p.what)}:${encodeURIComponent(p.whom)}`
+      `✓ ${p.what.slice(0, 20)} ${formatMoneyRu(p.amount)} ₽`,
+      `pay:${i}`
     )]
   );
   rows.push([Markup.button.callback("← Главная", "back_to_main")]);
@@ -630,6 +631,7 @@ bot.command("платежи", async (ctx) => {
   }
 
   const items = r.items || [];
+  st.tmp.paymentItems = items;
   const text  = renderPayments(items, r.total || 0);
 
   if (st.screenId) {
@@ -645,20 +647,20 @@ bot.on("callback_query", async (ctx) => {
 
   // ===== ОТМЕТИТЬ ОПЛАЧЕННЫМ =====
   if (data.startsWith("pay:")) {
-    const parts = data.split(":");
-    const day   = Number(parts[1]);
-    const what  = decodeURIComponent(parts[2] || "");
-    const whom  = decodeURIComponent(parts[3] || "");
+    const idx = Number(data.split(":")[1]);
+    const urgentItems = (st.tmp?.paymentItems || []).filter(p => p.diff <= 0);
+    const p = urgentItems[idx];
+
+    if (!p) { await ctx.answerCbQuery("Платёж не найден", { show_alert: true }); return; }
 
     await ctx.answerCbQuery("⏳ Отмечаю...");
 
-    const r = await markPaymentPaid(day, what, whom);
+    const r = await markPaymentPaid(p.day, p.what, p.whom);
     if (!r.ok) {
       await ctx.answerCbQuery("❌ Ошибка, попробуйте ещё раз", { show_alert: true });
       return;
     }
 
-    // Перезагружаем список платежей
     const updated = await getPayments();
     if (!updated.ok) {
       await ctx.answerCbQuery("✅ Оплачено!", { show_alert: true });
@@ -666,7 +668,8 @@ bot.on("callback_query", async (ctx) => {
     }
 
     const items = updated.items || [];
-    const text  = renderPayments(items, updated.total || 0);
+    st.tmp.paymentItems = items;
+    const text = renderPayments(items, updated.total || 0);
 
     try {
       await ctx.editMessageText(text, { parse_mode: "HTML", ...kbPayments(items) });
@@ -686,6 +689,7 @@ bot.on("callback_query", async (ctx) => {
     }
 
     const items = r.items || [];
+    st.tmp.paymentItems = items;
     const text  = renderPayments(items, r.total || 0);
 
     await safeEditMessage(ctx, st, text, { parse_mode: "HTML", ...kbPayments(items) });
